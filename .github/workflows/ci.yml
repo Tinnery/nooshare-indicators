@@ -67,6 +67,7 @@ jobs:
           import json
           import os
           import shutil
+          import signal
           import subprocess
           import tempfile
           import time
@@ -127,25 +128,28 @@ jobs:
           config_path.write_text(config, encoding="utf-8")
           os.chmod(config_path, 0o600)
 
-          process = None
           try:
               stunnel = shutil.which("stunnel") or shutil.which("stunnel4")
               if not stunnel:
                   raise SystemExit("BLOCKED: stunnel executable not found")
-              process = subprocess.Popen(
+              subprocess.run(
                   [stunnel, str(config_path)],
+                  check=True,
                   stdout=subprocess.DEVNULL,
                   stderr=subprocess.DEVNULL,
+                  timeout=10,
               )
 
               deadline = time.monotonic() + 30
               while time.monotonic() < deadline:
-                  if process.poll() is not None:
-                      raise SystemExit("FAIL: stunnel exited before listeners became ready")
                   listeners = subprocess.run(
                       ["ss", "-ltn"], check=True, capture_output=True, text=True
                   ).stdout
-                  if "127.0.0.1:15432" in listeners and "127.0.0.1:15500" in listeners:
+                  if (
+                      pid_path.is_file()
+                      and "127.0.0.1:15432" in listeners
+                      and "127.0.0.1:15500" in listeners
+                  ):
                       break
                   time.sleep(1)
               else:
@@ -202,13 +206,11 @@ jobs:
               print("PostgreSQL: PASS (SELECT 1; no business rows read)")
               print("RustFS: PASS (HeadBucket; no object listing or writes)")
           finally:
-              if process is not None and process.poll() is None:
-                  process.terminate()
+              if pid_path.is_file():
                   try:
-                      process.wait(timeout=5)
-                  except subprocess.TimeoutExpired:
-                      process.kill()
-                      process.wait(timeout=5)
+                      os.kill(int(pid_path.read_text(encoding="utf-8").strip()), signal.SIGTERM)
+                  except (ProcessLookupError, ValueError, OSError):
+                      pass
               shutil.rmtree(work_dir, ignore_errors=True)
           PY
 
