@@ -5,6 +5,22 @@ on:
     branches: [main]
   pull_request:
 
+  workflow_dispatch:
+    inputs:
+      infra_probe:
+        description: Run a read-only Pro DEV tunnel probe (main branch only)
+        type: boolean
+        default: false
+      workspace_source_export:
+        description: Export the exact source revision, tests and fixtures as an Actions artifact
+        type: boolean
+        default: false
+      workspace_source_ref:
+        description: Commit SHA, branch or tag to export (empty uses the workflow commit)
+        type: string
+        default: ""
+        required: false
+
 jobs:
   test:
     runs-on: ubuntu-latest
@@ -25,3 +41,415 @@ jobs:
 
       - name: Run tests
         run: pytest tests/ -v
+
+  pro_infrastructure_tunnel:
+    name: CI Infrastructure Tunnel (read-only probe)
+    if: github.event_name == 'workflow_dispatch' && inputs.infra_probe == true && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment: ci-probe
+    timeout-minutes: 10
+    concurrency:
+      group: pro-infrastructure-probe-${{ github.repository }}
+      cancel-in-progress: false
+    steps:
+      - name: Install tunnel and read-only probe tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq stunnel4 postgresql-client python3-boto3
+
+      # NOOSHARE_INFRA is scoped to this single step. Derived secrets stay in
+      # 0600 files under RUNNER_TEMP; never print the JSON, PSK, password or keys.
+      - name: Open CI Infrastructure Tunnel and verify read-only access
+        env:
+          NOOSHARE_INFRA: ${{ secrets.NOOSHARE_INFRA }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import os
+          import shutil
+          import signal
+          import subprocess
+          import tempfile
+          import time
+          from pathlib import Path
+
+          import boto3
+          from botocore.config import Config
+
+          raw = os.environ.get("NOOSHARE_INFRA", "")
+          if not raw:
+              raise SystemExit("BLOCKED: ci-probe environment secret NOOSHARE_INFRA is missing")
+          try:
+              infra = json.loads(raw)
+          except Exception:
+              raise SystemExit("BLOCKED: NOOSHARE_INFRA is not valid JSON")
+
+          required = (
+              "stunnel_host", "stunnel_psk", "pg_user", "pg_password",
+              "pg_db", "rustfs_access_key", "rustfs_secret_key", "rustfs_bucket",
+          )
+          values = {}
+          for name in required:
+              value = infra.get(name)
+              if not isinstance(value, str) or not value.strip():
+                  raise SystemExit("BLOCKED: NOOSHARE_INFRA missing field " + name)
+              values[name] = value.strip()
+
+          work_dir = Path(tempfile.mkdtemp(
+              prefix="pro-ci-probe-", dir=os.environ["RUNNER_TEMP"]
+          ))
+          os.chmod(work_dir, 0o700)
+          psk_path = work_dir / "k-ci.psk"
+          config_path = work_dir / "stunnel.conf"
+          pid_path = work_dir / "stunnel.pid"
+          psk_path.write_text(values["stunnel_psk"] + "\n", encoding="utf-8")
+          os.chmod(psk_path, 0o600)
+
+          config = "\n".join([
+              "pid = " + str(pid_path),
+              "",
+              "[pg]",
+              "client = yes",
+              "accept = 127.0.0.1:15432",
+              "connect = " + values["stunnel_host"] + ":27002",
+              "sni = pg.noos.com",
+              "ciphers = PSK",
+              "PSKsecrets = " + str(psk_path),
+              "",
+              "[rustfs]",
+              "client = yes",
+              "accept = 127.0.0.1:15500",
+              "connect = " + values["stunnel_host"] + ":27002",
+              "sni = rustfs.noos.com",
+              "ciphers = PSK",
+              "PSKsecrets = " + str(psk_path),
+              "",
+          ])
+          config_path.write_text(config, encoding="utf-8")
+          os.chmod(config_path, 0o600)
+
+          try:
+              stunnel = shutil.which("stunnel") or shutil.which("stunnel4")
+              if not stunnel:
+                  raise SystemExit("BLOCKED: stunnel executable not found")
+              subprocess.run(
+                  [stunnel, str(config_path)],
+                  check=True,
+                  stdout=subprocess.DEVNULL,
+                  stderr=subprocess.DEVNULL,
+                  timeout=10,
+              )
+
+              deadline = time.monotonic() + 30
+              while time.monotonic() < deadline:
+                  listeners = subprocess.run(
+                      ["ss", "-ltn"], check=True, capture_output=True, text=True
+                  ).stdout
+                  if (
+                      pid_path.is_file()
+                      and "127.0.0.1:15432" in listeners
+                      and "127.0.0.1:15500" in listeners
+                  ):
+                      break
+                  time.sleep(1)
+              else:
+                  raise SystemExit("FAIL: stunnel listeners did not become ready")
+
+              pg_env = os.environ.copy()
+              pg_env.update({
+                  "PGPASSWORD": values["pg_password"],
+                  "PGSSLMODE": "disable",
+              })
+              try:
+                  result = subprocess.run(
+                      [
+                          "psql", "-X", "-w", "-v", "ON_ERROR_STOP=1",
+                          "-h", "127.0.0.1", "-p", "15432",
+                          "-U", values["pg_user"], "-d", values["pg_db"],
+                          "-Atqc", "SELECT 1",
+                      ],
+                      env=pg_env,
+                      check=True,
+                      capture_output=True,
+                      text=True,
+                      timeout=15,
+                  )
+              except Exception as exc:
+                  raise SystemExit(
+                      "FAIL: PostgreSQL probe failed (" + type(exc).__name__ + ")"
+                  )
+              if result.stdout.strip() != "1":
+                  raise SystemExit("FAIL: PostgreSQL probe returned an unexpected result")
+
+              try:
+                  s3 = boto3.client(
+                      "s3",
+                      endpoint_url="http://127.0.0.1:15500",
+                      aws_access_key_id=values["rustfs_access_key"],
+                      aws_secret_access_key=values["rustfs_secret_key"],
+                      region_name="us-east-1",
+                      config=Config(
+                          signature_version="s3v4",
+                          s3={"addressing_style": "path"},
+                          connect_timeout=5,
+                          read_timeout=10,
+                          retries={"max_attempts": 1},
+                      ),
+                  )
+                  s3.head_bucket(Bucket=values["rustfs_bucket"])
+              except Exception as exc:
+                  raise SystemExit(
+                      "FAIL: RustFS bucket probe failed (" + type(exc).__name__ + ")"
+                  )
+
+              print("CI Infrastructure Tunnel: CONNECTED")
+              print("PostgreSQL: PASS (SELECT 1; no business rows read)")
+              print("RustFS: PASS (HeadBucket; no object listing or writes)")
+          finally:
+              if pid_path.is_file():
+                  try:
+                      os.kill(int(pid_path.read_text(encoding="utf-8").strip()), signal.SIGTERM)
+                  except (ProcessLookupError, ValueError, OSError):
+                      pass
+              shutil.rmtree(work_dir, ignore_errors=True)
+          PY
+
+
+  workspace_source_export:
+    name: Workspace Source Export
+    if: github.event_name == 'workflow_dispatch' && inputs.workspace_source_export == true
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out the requested source revision
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.workspace_source_ref || github.sha }}
+          fetch-depth: 0
+
+      - name: Package tracked source, tests and fixtures
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib
+          import io
+          import json
+          import os
+          import subprocess
+          import tarfile
+          from pathlib import Path, PurePosixPath
+
+          root = Path.cwd()
+          commit = subprocess.check_output(
+              ["git", "rev-parse", "HEAD"], text=True
+          ).strip()
+          repository = os.environ["GITHUB_REPOSITORY"]
+          records = []
+          excluded = []
+          max_file_bytes = 50 * 1024 * 1024
+
+          excluded_segments = {
+              ".git", ".venv", "venv", "__pycache__", ".pytest_cache",
+              ".mypy_cache", ".ruff_cache", ".runtime", ".generated",
+              ".cache", "node_modules",
+          }
+          third_party_binary_dirs = {
+              "third_party/bin", "third_party/binaries",
+              "third-party/bin", "third-party/binaries",
+              "offline-binaries", "offline-third-party",
+          }
+          tdx_raw_dirs = {
+              "tdx/raw", "tdx/raw_data", "tdx/raw-data",
+              "data/tdx/raw", "data/tdx/raw_data", "data/tdx/raw-data",
+          }
+
+          entries = subprocess.check_output(
+              ["git", "ls-files", "-s", "-z"]
+          ).split(b"\0")
+
+          for entry in entries:
+              if not entry:
+                  continue
+              metadata, raw_path = entry.split(b"\t", 1)
+              mode, _blob, _stage = metadata.decode("ascii").split()
+              path = raw_path.decode("utf-8", errors="strict")
+              rel = PurePosixPath(path)
+              parts = tuple(part.lower() for part in rel.parts)
+              reason = None
+
+              if mode == "160000":
+                  reason = "git-submodule-pointer"
+              elif any(part in excluded_segments for part in parts):
+                  reason = "generated-or-dependency-directory"
+              elif any(
+                  "/".join(parts[i:i + 2]) in third_party_binary_dirs
+                  for i in range(max(0, len(parts) - 1))
+              ):
+                  reason = "offline-third-party-binary"
+              elif any(
+                  "/".join(parts[i:i + 2]) in tdx_raw_dirs
+                  for i in range(max(0, len(parts) - 1))
+              ):
+                  reason = "tdx-raw-data"
+
+              source = root.joinpath(*rel.parts)
+              if reason is None and not source.is_file():
+                  reason = "not-a-regular-file"
+              if reason is None and source.stat().st_size > max_file_bytes:
+                  reason = "file-over-50-mib"
+
+              if reason:
+                  excluded.append({"path": path, "reason": reason})
+                  continue
+
+              data = source.read_bytes()
+              digest = hashlib.sha256(data).hexdigest()
+              file_mode = 0o755 if mode.endswith("755") else 0o644
+              records.append({
+                  "path": path,
+                  "size": len(data),
+                  "sha256": digest,
+                  "mode": oct(file_mode),
+              })
+
+          records.sort(key=lambda item: item["path"])
+          excluded.sort(key=lambda item: item["path"])
+          manifest = {
+              "schema_version": 1,
+              "repository": repository,
+              "commit": commit,
+              "file_count": len(records),
+              "fixture_file_count": sum(
+                  1 for item in records
+                  if any(
+                      marker in part.lower()
+                      for part in PurePosixPath(item["path"]).parts
+                      for marker in ("test", "fixture", "sample")
+                  )
+              ),
+              "files": records,
+              "excluded_file_count": len(excluded),
+              "excluded": excluded,
+              "exclusion_policy": {
+                  "max_file_bytes": max_file_bytes,
+                  "purpose": "exclude generated dependencies, offline third-party binaries and large raw assets while retaining tracked tests and fixtures",
+              },
+          }
+          manifest_bytes = json.dumps(
+              manifest, ensure_ascii=False, sort_keys=True, indent=2
+          ).encode("utf-8")
+
+          output_dir = Path(os.environ["RUNNER_TEMP"])
+          archive_path = output_dir / "workspace-source.tar.gz"
+          manifest_path = output_dir / "workspace-source-manifest.json"
+
+          with tarfile.open(archive_path, "w:gz", compresslevel=6) as archive:
+              for item in records:
+                  data = root.joinpath(*PurePosixPath(item["path"]).parts).read_bytes()
+                  info = tarfile.TarInfo(item["path"])
+                  info.size = len(data)
+                  info.mode = int(item["mode"], 8)
+                  info.mtime = 0
+                  archive.addfile(info, io.BytesIO(data))
+
+              info = tarfile.TarInfo("WORKSPACE-MANIFEST.json")
+              info.size = len(manifest_bytes)
+              info.mode = 0o644
+              info.mtime = 0
+              archive.addfile(info, io.BytesIO(manifest_bytes))
+
+          manifest_path.write_bytes(manifest_bytes)
+          archive_hash = hashlib.sha256(archive_path.read_bytes()).hexdigest()
+          print(json.dumps({
+              "status": "EXPORTED",
+              "repository": repository,
+              "commit": commit,
+              "files": len(records),
+              "fixture_files": manifest["fixture_file_count"],
+              "excluded": len(excluded),
+              "archive_bytes": archive_path.stat().st_size,
+              "archive_sha256": archive_hash,
+          }, sort_keys=True))
+          PY
+
+      - name: Upload exact source artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: workspace-source-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/workspace-source.tar.gz
+            ${{ runner.temp }}/workspace-source-manifest.json
+          if-no-files-found: error
+          retention-days: 3
+
+  workspace_artifact_materialization:
+    name: Workspace Artifact Materialization
+    needs: workspace_source_export
+    if: needs.workspace_source_export.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Download source artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: workspace-source-${{ github.run_id }}
+          path: ${{ runner.temp }}/workspace-source-artifact
+
+      - name: Materialize and verify Python workspace snapshot
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import tarfile
+          from pathlib import Path, PurePosixPath
+
+          artifact_dir = Path("${{ runner.temp }}") / "workspace-source-artifact"
+          archive_path = artifact_dir / "workspace-source.tar.gz"
+          manifest_path = artifact_dir / "workspace-source-manifest.json"
+          destination = Path("${{ runner.temp }}") / "materialized-python-workspace"
+          manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+          destination.mkdir(parents=True, exist_ok=True)
+
+          with tarfile.open(archive_path, "r:gz") as archive:
+              members = {member.name: member for member in archive.getmembers()}
+              embedded = members.get("WORKSPACE-MANIFEST.json")
+              if embedded is None or not embedded.isfile():
+                  raise SystemExit("materialization failed: embedded manifest missing")
+              embedded_manifest = archive.extractfile(embedded).read()
+              if embedded_manifest != manifest_path.read_bytes():
+                  raise SystemExit("materialization failed: manifest mismatch")
+
+              for item in manifest["files"]:
+                  path = PurePosixPath(item["path"])
+                  if path.is_absolute() or ".." in path.parts:
+                      raise SystemExit("materialization failed: unsafe archive path")
+                  member = members.get(item["path"])
+                  if member is None or not member.isfile():
+                      raise SystemExit("materialization failed: source member missing")
+                  data = archive.extractfile(member).read()
+                  if len(data) != item["size"]:
+                      raise SystemExit("materialization failed: file size mismatch")
+                  if hashlib.sha256(data).hexdigest() != item["sha256"]:
+                      raise SystemExit("materialization failed: file hash mismatch")
+
+                  target = destination.joinpath(*path.parts)
+                  target.parent.mkdir(parents=True, exist_ok=True)
+                  target.write_bytes(data)
+                  target.chmod(int(item["mode"], 8))
+
+          materialized_count = sum(
+              1 for path in destination.rglob("*") if path.is_file()
+          )
+          if materialized_count != manifest["file_count"]:
+              raise SystemExit("materialization failed: file count mismatch")
+
+          print(json.dumps({
+              "status": "MATERIALIZED_AND_VERIFIED",
+              "repository": manifest["repository"],
+              "commit": manifest["commit"],
+              "files": materialized_count,
+              "fixture_files": manifest["fixture_file_count"],
+          }, sort_keys=True))
+          PY
