@@ -61,34 +61,6 @@ nooshare-design/implementation-docs/nooshare-indicators/，本仓库不复制。
 | test-stock | Current | 测试单只股票的指标计算 |
 | validate | Current | 与 TA-Lib 交叉验证（可选依赖） |
 
-## 数据边界
-
-### Read-only（上游拥有，indicators 只读）
-
-生产代码 infrastructure/data_loader.py 只读 public.* 表：
-
-| Schema | Table | 说明 |
-|--------|-------|------|
-| public | trading_calendar | 交易日历 |
-| public | canonical_symbol | 标准化证券代码 |
-| public | st_status_pit | ST 状态（时点口径） |
-| public | limit_rule_pit | 涨跌停规则（时点口径） |
-| public | hfq_daily | 后复权日线行情 |
-
-价格口径：OHLC 用 HFQ（后复权），Volume/Amount 保留原始行情语义。依据 ADR-0001。
-
-### Read-write（indicators 拥有）
-
-| Schema | Table | 说明 |
-|--------|-------|------|
-| indicators | meta | 指标注册表 |
-| indicators | daily_base_aligned | 对齐后的基础行情 |
-| indicators | daily_volatility | 波动率指标 |
-| indicators | daily_momentum | 动量指标 |
-| indicators | daily_volume_indicators | 成交量指标 |
-| indicators | daily_price_position | 价格位置指标 |
-| indicators | cross_section_stats | 截面统计 |
-
 ## 计算约束
 
 1. **严格无未来函数**：T 日指标只使用 <=T 数据
@@ -106,19 +78,6 @@ uv run pytest
 - TA-Lib 一致性：max abs error < 1e-6
 - 收益可加性：误差 < 1e-10
 - 截面完整性：缺失率 < 0.1%
-
-## 当前能力状态
-
-| 能力 | 状态 | 说明 |
-|------|------|------|
-| 收益率指标 | done | 简单收益率、对数收益率 |
-| 波动率指标 | done | 4 种估计量（CCC、Parkinson、GK、RS） |
-| 动量指标 | done | RSI、MACD、ROC、KAMA、EMA、SMA、DEMA |
-| 成交量指标 | done | VWAP、OBV、Volume Ratio、Volume Z-Score |
-| 价格位置指标 | done | 布林带、ATR、N日新高/新低、均线偏离度 |
-| 截面标准化 | done | 每指标输出 rank + zscore |
-| TA-Lib 验证 | partial | 可选依赖，未全量运行 |
-| 分钟级指标 | todo | 路线图项 |
 
 ## 主机约束
 
