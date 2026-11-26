@@ -498,10 +498,10 @@ jobs:
                     'idx_run_order_trade_id',
                     'idx_run_exit_event_trade_id'
                   ]::text[]) AS wanted(name)
-                  LEFT JOIN pg_class ic ON ic.relname = wanted.name
+                  LEFT JOIN pg_class ic
+                    ON ic.relname = wanted.name
+                   AND ic.relnamespace = to_regnamespace('strategy_lab')
                   LEFT JOIN pg_index idx ON idx.indexrelid = ic.oid
-                  LEFT JOIN pg_namespace ins ON ins.oid = ic.relnamespace
-                  WHERE ins.nspname = 'strategy_lab' OR ic.oid IS NULL
                 )
               ));
               COMMIT;
@@ -532,7 +532,7 @@ jobs:
 
               audit_path = Path(os.environ["RUNNER_TEMP"]) / "strategy-lab-readonly-audit.json"
               audit_path.write_text(
-                  json.dumps(audit_report, ensure_ascii=False, sort_keys=True, indent=2) + "\\n",
+                  json.dumps(audit_report, ensure_ascii=False, sort_keys=True, indent=2) + "\n",
                   encoding="utf-8",
               )
               table_count = len(audit_report.get("tables", []))
