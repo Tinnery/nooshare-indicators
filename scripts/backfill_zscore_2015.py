@@ -13,9 +13,9 @@ Behaviour:
     (PG_HOST / PG_PORT / PG_USER / PG_PASSWORD / PG_DATABASE / PG_SSLMODE
     environment variables or a project-root .env). No credentials in code.
 
-Target table: indicators.daily_ts_zscore (owned by this repo; DDL lives in
-nooshare_indicators/infrastructure/database.py::init_schema and is ensured
-on startup below).
+Target table: indicators.daily_ts_zscore (owned by this repo).
+Schema DDL is applied only when --apply is explicitly supplied. A dry-run
+checks that the target table exists but never creates or alters database objects.
 
 Usage:
     cd nooshare-indicators
@@ -60,6 +60,26 @@ def ensure_table() -> None:
         "CREATE INDEX IF NOT EXISTS idx_daily_ts_zscore_date "
         "ON indicators.daily_ts_zscore (date)"
     )
+
+
+def target_table_exists() -> bool:
+    """Check the target relation using SELECT only."""
+    df = db.read_sql(
+        "SELECT to_regclass('indicators.daily_ts_zscore') AS relation"
+    )
+    return not df.empty and pd.notna(df.iloc[0]["relation"])
+
+
+def prepare_target_table(apply: bool) -> None:
+    """Apply DDL only in explicit apply mode; dry-run must remain read-only."""
+    if apply:
+        ensure_table()
+        return
+    if not target_table_exists():
+        raise RuntimeError(
+            "indicators.daily_ts_zscore does not exist. Dry-run will not create "
+            "tables or indexes; apply the schema explicitly or rerun with --apply."
+        )
 
 
 def get_pit_stocks() -> pd.DataFrame:
@@ -200,14 +220,14 @@ def main() -> None:
     parser.add_argument(
         "--apply",
         action="store_true",
-        help="Write to the database. WITHOUT this flag the script is a read-only dry-run.",
+        help="Create required table/index and write records. Without this flag, perform a read-only dry-run.",
     )
     parser.add_argument("--start-date", type=int, default=SIGNAL_START_DATE, help="Signal start date")
     parser.add_argument("--max-date", type=int, default=None, help="Max date (default: latest in DB)")
     parser.add_argument("--symbols", nargs="*", help="Specific symbols to process")
     args = parser.parse_args()
 
-    ensure_table()
+    prepare_target_table(apply=args.apply)
 
     max_date = args.max_date
     if max_date is None:
