@@ -887,6 +887,23 @@ jobs:
                       GROUP BY r.status, r.strategy_commit, r.backtest_commit
                     ) q
                   ),
+                  'runs_by_month', (
+                    SELECT COALESCE(
+                      jsonb_agg(to_jsonb(q) ORDER BY q.run_month, q.status),
+                      '[]'::jsonb
+                    )
+                    FROM (
+                      SELECT date_trunc('month', r.created_at)::date AS run_month,
+                             r.status,
+                             count(*)::bigint AS run_count,
+                             count(*) FILTER (WHERE s.run_id IS NULL)::bigint AS missing_summary_count,
+                             count(*) FILTER (WHERE p.run_id IS NULL)::bigint AS missing_package_count
+                      FROM strategy_lab.experiment_run r
+                      LEFT JOIN strategy_lab.run_summary s ON s.run_id = r.run_id
+                      LEFT JOIN strategy_lab.run_package p ON p.run_id = r.run_id
+                      GROUP BY date_trunc('month', r.created_at)::date, r.status
+                    ) q
+                  ),
                   'trade_signal_by_version', (
                     WITH entry_trace AS (
                       SELECT t.run_id, t.trade_id,
