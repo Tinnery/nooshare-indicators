@@ -248,26 +248,6 @@ jobs:
                   "PGPASSWORD": values["pg_password"],
                   "PGSSLMODE": "disable",
               })
-              try:
-                  result = subprocess.run(
-                      [
-                          "psql", "-X", "-w", "-v", "ON_ERROR_STOP=1",
-                          "-h", "127.0.0.1", "-p", "15432",
-                          "-U", values["pg_user"], "-d", values["pg_db"],
-                          "-Atqc", "SELECT 1",
-                      ],
-                      env=pg_env,
-                      check=True,
-                      capture_output=True,
-                      text=True,
-                      timeout=15,
-                  )
-              except Exception as exc:
-                  raise SystemExit(
-                      "FAIL: PostgreSQL probe failed (" + type(exc).__name__ + ")"
-                  )
-              if result.stdout.strip() != "1":
-                  raise SystemExit("FAIL: PostgreSQL probe returned an unexpected result")
 
               try:
                   s3 = boto3.client(
@@ -528,7 +508,7 @@ jobs:
                       "psql", "-X", "-w", "-v", "ON_ERROR_STOP=1",
                       "-h", "127.0.0.1", "-p", "15432",
                       "-U", values["pg_user"], "-d", values["pg_db"],
-                      "-Atqc", audit_sql,
+                      "-Atqc", "SELECT 1;\n" + audit_sql,
                   ],
                   env=pg_env,
                   check=False,
@@ -546,8 +526,11 @@ jobs:
                       print("PostgreSQL audit error:")
                       print(detail[-6000:])
                   raise SystemExit("FAIL: Strategy Lab audit SQL execution failed")
+              audit_lines = audit_result.stdout.splitlines()
+              if not audit_lines or audit_lines[0].strip() != "1":
+                  raise SystemExit("FAIL: PostgreSQL session health check returned an unexpected result")
               try:
-                  audit_report = json.loads(audit_result.stdout.strip())
+                  audit_report = json.loads("\n".join(audit_lines[1:]).strip())
               except Exception as exc:
                   raise SystemExit("FAIL: Strategy Lab audit returned invalid JSON") from exc
 
