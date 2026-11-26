@@ -125,7 +125,7 @@ jobs:
         run: pytest tests/ -v
 
   pro_infrastructure_tunnel:
-    name: CI Infrastructure Tunnel (read-only probe)
+    name: Pro DEV Tunnel + Strategy Lab read-only audit
     needs: validate_dispatch_request
     if: >-
       always() && (
@@ -290,6 +290,259 @@ jobs:
                       "FAIL: RustFS bucket probe failed (" + type(exc).__name__ + ")"
                   )
 
+              # Read DEV Strategy Lab metadata only. Never select business rows or payload values.
+              if values["pg_db"] != "nooshare_dev":
+                  raise SystemExit("BLOCKED: Strategy Lab audit is restricted to nooshare_dev")
+
+              audit_sql = r"""
+              BEGIN TRANSACTION READ ONLY;
+              SET LOCAL statement_timeout = '30s';
+              SELECT jsonb_pretty(jsonb_build_object(
+                'database', current_database(),
+                'current_user', current_user,
+                'server_version', current_setting('server_version'),
+                'transaction_read_only', current_setting('transaction_read_only'),
+                'role_privileges', (
+                  SELECT jsonb_build_object(
+                    'superuser', r.rolsuper,
+                    'create_role', r.rolcreaterole,
+                    'create_database', r.rolcreatedb,
+                    'replication', r.rolreplication,
+                    'bypass_rls', r.rolbypassrls
+                  )
+                  FROM pg_roles r WHERE r.rolname = current_user
+                ),
+                'database_privileges', jsonb_build_object(
+                  'connect', has_database_privilege(current_user, current_database(), 'CONNECT'),
+                  'create', has_database_privilege(current_user, current_database(), 'CREATE'),
+                  'temporary', has_database_privilege(current_user, current_database(), 'TEMP')
+                ),
+                'strategy_lab_schema_privileges', CASE
+                  WHEN to_regnamespace('strategy_lab') IS NULL THEN NULL
+                  ELSE jsonb_build_object(
+                    'usage', has_schema_privilege(current_user, 'strategy_lab', 'USAGE'),
+                    'create', has_schema_privilege(current_user, 'strategy_lab', 'CREATE')
+                  )
+                END,
+                'schema_exists', to_regnamespace('strategy_lab') IS NOT NULL,
+                'tables', (
+                  SELECT COALESCE(jsonb_agg(jsonb_build_object(
+                    'name', c.relname,
+                    'kind', c.relkind,
+                    'estimated_live_rows', COALESCE(s.n_live_tup, 0),
+                    'estimated_dead_rows', COALESCE(s.n_dead_tup, 0),
+                    'total_relation_bytes', pg_total_relation_size(c.oid)
+                  ) ORDER BY c.relname), '[]'::jsonb)
+                  FROM pg_class c
+                  JOIN pg_namespace n ON n.oid = c.relnamespace
+                  LEFT JOIN pg_stat_user_tables s
+                    ON s.relid = c.oid
+                  WHERE n.nspname = 'strategy_lab'
+                    AND c.relkind IN ('r', 'p')
+                ),
+                'exact_table_counts', (
+                  SELECT COALESCE(jsonb_agg(jsonb_build_object(
+                    'table', t.table_name,
+                    'row_count', (
+                      xpath('/table/row/c/text()', query_to_xml(
+                        'SELECT count(*) AS c FROM strategy_lab.' || quote_ident(t.table_name),
+                        false, true, ''
+                      ))
+                    )[1]::text::bigint
+                  ) ORDER BY t.table_name), '[]'::jsonb)
+                  FROM unnest(ARRAY[
+                    'experiment', 'experiment_variant', 'experiment_run',
+                    'universe_snapshot', 'universe_member', 'signal',
+                    'run_signal', 'run_trade', 'run_exit_event', 'run_order',
+                    'run_fill', 'run_trade_fill', 'run_equity_point',
+                    'run_summary', 'run_package'
+                  ]::text[]) AS t(table_name)
+                  WHERE to_regclass('strategy_lab.' || quote_ident(t.table_name)) IS NOT NULL
+                ),
+                'columns', (
+                  SELECT COALESCE(jsonb_agg(jsonb_build_object(
+                    'table', c.relname,
+                    'ordinal', a.attnum,
+                    'column', a.attname,
+                    'data_type', format_type(a.atttypid, a.atttypmod),
+                    'nullable', NOT a.attnotnull,
+                    'default', pg_get_expr(d.adbin, d.adrelid)
+                  ) ORDER BY c.relname, a.attnum), '[]'::jsonb)
+                  FROM pg_class c
+                  JOIN pg_namespace n ON n.oid = c.relnamespace
+                  JOIN pg_attribute a ON a.attrelid = c.oid
+                  LEFT JOIN pg_attrdef d ON d.adrelid = c.oid AND d.adnum = a.attnum
+                  WHERE n.nspname = 'strategy_lab'
+                    AND c.relkind IN ('r', 'p')
+                    AND a.attnum > 0
+                    AND NOT a.attisdropped
+                ),
+                'constraints', (
+                  SELECT COALESCE(jsonb_agg(jsonb_build_object(
+                    'table', c.relname,
+                    'name', con.conname,
+                    'type', con.contype,
+                    'validated', con.convalidated,
+                    'definition', pg_get_constraintdef(con.oid)
+                  ) ORDER BY c.relname, con.conname), '[]'::jsonb)
+                  FROM pg_constraint con
+                  JOIN pg_class c ON c.oid = con.conrelid
+                  JOIN pg_namespace n ON n.oid = c.relnamespace
+                  WHERE n.nspname = 'strategy_lab'
+                ),
+                'indexes', (
+                  SELECT COALESCE(jsonb_agg(jsonb_build_object(
+                    'table', t.relname,
+                    'name', i.relname,
+                    'valid', x.indisvalid,
+                    'unique', x.indisunique,
+                    'definition', pg_get_indexdef(x.indexrelid)
+                  ) ORDER BY t.relname, i.relname), '[]'::jsonb)
+                  FROM pg_index x
+                  JOIN pg_class t ON t.oid = x.indrelid
+                  JOIN pg_class i ON i.oid = x.indexrelid
+                  JOIN pg_namespace n ON n.oid = t.relnamespace
+                  WHERE n.nspname = 'strategy_lab'
+                ),
+                'migration_marker_tables', (
+                  SELECT COALESCE(jsonb_agg(c.relname ORDER BY c.relname), '[]'::jsonb)
+                  FROM pg_class c
+                  JOIN pg_namespace n ON n.oid = c.relnamespace
+                  WHERE n.nspname = 'strategy_lab'
+                    AND c.relkind IN ('r', 'p')
+                    AND (
+                      c.relname ILIKE '%migration%'
+                      OR c.relname ILIKE '%version%'
+                      OR c.relname = 'alembic_version'
+                    )
+                ),
+                'migration_checks', jsonb_build_object(
+                  'v02_expected_tables_present', (
+                    SELECT count(*) = 11
+                    FROM unnest(ARRAY[
+                      'experiment_variant', 'universe_snapshot', 'universe_member',
+                      'run_signal', 'run_order', 'run_fill', 'run_trade',
+                      'run_trade_fill', 'run_equity_point', 'run_summary',
+                      'run_package'
+                    ]::text[]) AS t(name)
+                    WHERE to_regclass('strategy_lab.' || quote_ident(t.name)) IS NOT NULL
+                  ),
+                  'v03_exit_event_table_present', to_regclass('strategy_lab.run_exit_event') IS NOT NULL,
+                  'v03_order_exit_event_column_present', EXISTS (
+                    SELECT 1 FROM pg_attribute a
+                    JOIN pg_class c ON c.oid = a.attrelid
+                    JOIN pg_namespace n ON n.oid = c.relnamespace
+                    WHERE n.nspname = 'strategy_lab'
+                      AND c.relname = 'run_order'
+                      AND a.attname = 'exit_event_id'
+                      AND a.attnum > 0 AND NOT a.attisdropped
+                  ),
+                  'v03_order_decision_reason_column_present', EXISTS (
+                    SELECT 1 FROM pg_attribute a
+                    JOIN pg_class c ON c.oid = a.attrelid
+                    JOIN pg_namespace n ON n.oid = c.relnamespace
+                    WHERE n.nspname = 'strategy_lab'
+                      AND c.relname = 'run_order'
+                      AND a.attname = 'decision_reason'
+                      AND a.attnum > 0 AND NOT a.attisdropped
+                  ),
+                  'v04_order_trade_id_column_present', EXISTS (
+                    SELECT 1 FROM pg_attribute a
+                    JOIN pg_class c ON c.oid = a.attrelid
+                    JOIN pg_namespace n ON n.oid = c.relnamespace
+                    WHERE n.nspname = 'strategy_lab'
+                      AND c.relname = 'run_order'
+                      AND a.attname = 'trade_id'
+                      AND a.attnum > 0 AND NOT a.attisdropped
+                  ),
+                  'v04_exit_event_decision_date_type', (
+                    SELECT format_type(a.atttypid, a.atttypmod)
+                    FROM pg_attribute a
+                    JOIN pg_class c ON c.oid = a.attrelid
+                    JOIN pg_namespace n ON n.oid = c.relnamespace
+                    WHERE n.nspname = 'strategy_lab'
+                      AND c.relname = 'run_exit_event'
+                      AND a.attname = 'decision_date'
+                      AND a.attnum > 0 AND NOT a.attisdropped
+                    LIMIT 1
+                  )
+                ),
+                'v04_required_constraints', (
+                  SELECT COALESCE(jsonb_object_agg(
+                    wanted.name,
+                    CASE WHEN con.oid IS NULL THEN jsonb_build_object('present', false)
+                         ELSE jsonb_build_object('present', true, 'validated', con.convalidated,
+                                                 'definition', pg_get_constraintdef(con.oid))
+                    END
+                  ), '{}'::jsonb)
+                  FROM unnest(ARRAY[
+                    'fk_run_exit_event_run_trade',
+                    'fk_run_order_run_trade',
+                    'fk_run_order_run_exit_event',
+                    'chk_run_order_exit_event_consistency'
+                  ]::text[]) AS wanted(name)
+                  LEFT JOIN pg_constraint con
+                    ON con.conname = wanted.name
+                   AND con.connamespace = to_regnamespace('strategy_lab')
+                ),
+                'v04_required_indexes', (
+                  SELECT COALESCE(jsonb_object_agg(
+                    wanted.name,
+                    CASE WHEN idx.indexrelid IS NULL THEN jsonb_build_object('present', false)
+                         ELSE jsonb_build_object('present', true, 'valid', idx.indisvalid,
+                                                 'unique', idx.indisunique)
+                    END
+                  ), '{}'::jsonb)
+                  FROM unnest(ARRAY[
+                    'uq_run_exit_event_run_id_event_id',
+                    'idx_run_order_trade_id',
+                    'idx_run_exit_event_trade_id'
+                  ]::text[]) AS wanted(name)
+                  LEFT JOIN pg_class ic ON ic.relname = wanted.name
+                  LEFT JOIN pg_index idx ON idx.indexrelid = ic.oid
+                  LEFT JOIN pg_namespace ins ON ins.oid = ic.relnamespace
+                  WHERE ins.nspname = 'strategy_lab' OR ic.oid IS NULL
+                )
+              ));
+              COMMIT;
+              """
+
+              audit_result = subprocess.run(
+                  [
+                      "psql", "-X", "-w", "-v", "ON_ERROR_STOP=1",
+                      "-h", "127.0.0.1", "-p", "15432",
+                      "-U", values["pg_user"], "-d", values["pg_db"],
+                      "-Atqc", audit_sql,
+                  ],
+                  env=pg_env,
+                  check=True,
+                  capture_output=True,
+                  text=True,
+                  timeout=40,
+              )
+              try:
+                  audit_report = json.loads(audit_result.stdout.strip())
+              except Exception as exc:
+                  raise SystemExit("FAIL: Strategy Lab audit returned invalid JSON") from exc
+
+              if audit_report.get("database") != "nooshare_dev":
+                  raise SystemExit("FAIL: Strategy Lab audit database guard mismatch")
+              if audit_report.get("transaction_read_only") != "on":
+                  raise SystemExit("FAIL: Strategy Lab audit was not read-only")
+
+              audit_path = Path(os.environ["RUNNER_TEMP"]) / "strategy-lab-readonly-audit.json"
+              audit_path.write_text(
+                  json.dumps(audit_report, ensure_ascii=False, sort_keys=True, indent=2) + "\\n",
+                  encoding="utf-8",
+              )
+              table_count = len(audit_report.get("tables", []))
+              exact_count_tables = len(audit_report.get("exact_table_counts", []))
+              print("Strategy Lab DEV metadata audit: PASS (read-only)")
+              print(f"Strategy Lab tables discovered: {table_count}")
+              print(f"Strategy Lab exact table counts: {exact_count_tables}")
+              print(f"Current DB role superuser: {audit_report.get('role_privileges', {}).get('superuser')}")
+              print(f"Strategy Lab schema CREATE privilege: {audit_report.get('strategy_lab_schema_privileges', {}).get('create') if audit_report.get('strategy_lab_schema_privileges') else None}")
+
               print("CI Infrastructure Tunnel: CONNECTED")
               print("PostgreSQL: PASS (SELECT 1; no business rows read)")
               print("RustFS: PASS (HeadBucket; no object listing or writes)")
@@ -301,6 +554,14 @@ jobs:
                       pass
               shutil.rmtree(work_dir, ignore_errors=True)
           PY
+
+      - name: Upload read-only Strategy Lab audit
+        uses: actions/upload-artifact@v4
+        with:
+          name: strategy-lab-readonly-audit-${{ github.run_id }}
+          path: ${{ runner.temp }}/strategy-lab-readonly-audit.json
+          if-no-files-found: error
+          retention-days: 3
 
 
   workspace_source_export:
