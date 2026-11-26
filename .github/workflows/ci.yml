@@ -531,11 +531,23 @@ jobs:
                       "-Atqc", audit_sql,
                   ],
                   env=pg_env,
-                  check=True,
+                  check=False,
                   capture_output=True,
                   text=True,
                   timeout=40,
               )
+              try:
+                  audit_report = json.loads(audit_result.stdout.strip())
+              if audit_result.returncode != 0:
+                  detail = (audit_result.stderr or "").strip()
+                  print(
+                      "FAIL: Strategy Lab audit SQL exited with code "
+                      + str(audit_result.returncode)
+                  )
+                  if detail:
+                      print("PostgreSQL audit error:")
+                      print(detail[-6000:])
+                  raise SystemExit("FAIL: Strategy Lab audit SQL execution failed")
               try:
                   audit_report = json.loads(audit_result.stdout.strip())
               except Exception as exc:
