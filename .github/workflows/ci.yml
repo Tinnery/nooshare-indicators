@@ -536,8 +536,6 @@ jobs:
                   text=True,
                   timeout=40,
               )
-              try:
-                  audit_report = json.loads(audit_result.stdout.strip())
               if audit_result.returncode != 0:
                   detail = (audit_result.stderr or "").strip()
                   print(
