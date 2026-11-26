@@ -861,6 +861,236 @@ jobs:
               END
               $strategy_lab_consistency$;
 
+              DO $strategy_lab_diagnostic_slices$
+              DECLARE
+                diagnostics_report jsonb;
+              BEGIN
+                SELECT jsonb_build_object(
+                  'schema_version', 1,
+                  'runs_by_version', (
+                    SELECT COALESCE(jsonb_agg(to_jsonb(q) ORDER BY q.run_count DESC), '[]'::jsonb)
+                    FROM (
+                      SELECT r.status,
+                             COALESCE(r.strategy_commit, 'unknown') AS strategy_commit,
+                             COALESCE(r.backtest_commit, 'unknown') AS backtest_commit,
+                             count(*)::bigint AS run_count,
+                             count(*) FILTER (WHERE s.run_id IS NULL)::bigint AS missing_summary_count,
+                             count(*) FILTER (WHERE p.run_id IS NULL)::bigint AS missing_package_count,
+                             count(*) FILTER (WHERE p.schema_version = 1)::bigint AS package_schema_v1_count,
+                             count(*) FILTER (WHERE p.schema_version = 2)::bigint AS package_schema_v2_count,
+                             count(*) FILTER (
+                               WHERE p.package #>> '{backtest_result,schema_version}' = '2'
+                             )::bigint AS backtest_result_schema_v2_count
+                      FROM strategy_lab.experiment_run r
+                      LEFT JOIN strategy_lab.run_summary s ON s.run_id = r.run_id
+                      LEFT JOIN strategy_lab.run_package p ON p.run_id = r.run_id
+                      GROUP BY r.status, r.strategy_commit, r.backtest_commit
+                    ) q
+                  ),
+                  'trade_signal_by_version', (
+                    WITH entry_trace AS (
+                      SELECT t.run_id, t.trade_id,
+                             count(a.fill_id)::bigint AS entry_allocation_count,
+                             count(o.order_id)::bigint AS entry_order_count,
+                             count(o.order_id) FILTER (
+                               WHERE o.signal_id IS NOT NULL
+                             )::bigint AS entry_orders_with_signal_count,
+                             count(o.order_id) FILTER (
+                               WHERE o.signal_id IS NOT NULL AND s.signal_id IS NULL
+                             )::bigint AS entry_orders_with_unresolved_signal_count,
+                             count(o.order_id) FILTER (
+                               WHERE o.order_id IS NOT NULL
+                                 AND (o.exchange IS DISTINCT FROM t.exchange
+                                   OR o.canonical_id IS DISTINCT FROM t.canonical_id)
+                             )::bigint AS entry_order_security_mismatch_count,
+                             count(o.order_id) FILTER (
+                               WHERE o.signal_id = t.initial_signal_id
+                                 AND o.signal_id IS NOT NULL
+                             )::bigint AS entry_orders_matching_initial_signal_count
+                      FROM strategy_lab.run_trade t
+                      LEFT JOIN strategy_lab.run_trade_fill a
+                        ON a.run_id = t.run_id
+                       AND a.trade_id = t.trade_id
+                       AND a.allocation_role = 'ENTRY'
+                      LEFT JOIN strategy_lab.run_fill f
+                        ON f.run_id = a.run_id AND f.fill_id = a.fill_id
+                      LEFT JOIN strategy_lab.run_order o
+                        ON o.run_id = f.run_id AND o.order_id = f.order_id
+                      LEFT JOIN strategy_lab.run_signal s
+                        ON s.run_id = o.run_id AND s.signal_id = o.signal_id
+                      GROUP BY t.run_id, t.trade_id
+                    )
+                    SELECT COALESCE(jsonb_agg(to_jsonb(q)), '[]'::jsonb)
+                    FROM (
+                      SELECT COALESCE(r.strategy_commit, 'unknown') AS strategy_commit,
+                             COALESCE(r.backtest_commit, 'unknown') AS backtest_commit,
+                             count(*)::bigint AS trade_count,
+                             count(*) FILTER (
+                               WHERE t.initial_signal_id IS NULL
+                             )::bigint AS missing_initial_signal_count,
+                             count(*) FILTER (
+                               WHERE t.initial_signal_id IS NULL
+                                 AND COALESCE(e.entry_order_count, 0) = 0
+                             )::bigint AS missing_signal_and_entry_order_count,
+                             count(*) FILTER (
+                               WHERE t.initial_signal_id IS NULL
+                                 AND COALESCE(e.entry_order_count, 0) > 0
+                                 AND COALESCE(e.entry_orders_with_signal_count, 0) = 0
+                             )::bigint AS missing_signal_and_all_entry_orders_without_signal_count,
+                             count(*) FILTER (
+                               WHERE t.initial_signal_id IS NULL
+                                 AND COALESCE(e.entry_orders_with_signal_count, 0) > 0
+                             )::bigint AS missing_signal_but_entry_order_has_signal_count,
+                             count(*) FILTER (
+                               WHERE t.initial_signal_id IS NULL
+                                 AND COALESCE(e.entry_orders_with_unresolved_signal_count, 0) > 0
+                             )::bigint AS entry_order_signal_not_found_in_run_signal_count,
+                             count(*) FILTER (
+                               WHERE t.initial_signal_id IS NULL
+                                 AND COALESCE(e.entry_order_security_mismatch_count, 0) > 0
+                             )::bigint AS entry_order_security_mismatch_count,
+                             count(*) FILTER (
+                               WHERE t.initial_signal_id IS NOT NULL
+                                 AND COALESCE(e.entry_orders_matching_initial_signal_count, 0) = 0
+                             )::bigint AS nonnull_initial_signal_not_found_on_entry_order_count
+                      FROM strategy_lab.run_trade t
+                      JOIN strategy_lab.experiment_run r ON r.run_id = t.run_id
+                      LEFT JOIN entry_trace e ON e.run_id = t.run_id AND e.trade_id = t.trade_id
+                      GROUP BY r.strategy_commit, r.backtest_commit
+                    ) q
+                  ),
+                  'missing_sell_trade_by_version', (
+                    WITH sell_trace AS (
+                      SELECT o.run_id, o.order_id,
+                             count(DISTINCT f.fill_id)::bigint AS fill_count,
+                             count(DISTINCT a.fill_id)::bigint AS allocated_fill_count,
+                             count(DISTINCT a.trade_id)::bigint AS allocated_trade_count,
+                             count(DISTINCT a.fill_id) FILTER (
+                               WHERE t.exchange IS DISTINCT FROM o.exchange
+                                  OR t.canonical_id IS DISTINCT FROM o.canonical_id
+                             )::bigint AS allocated_security_mismatch_count
+                      FROM strategy_lab.run_order o
+                      LEFT JOIN strategy_lab.run_fill f
+                        ON f.run_id = o.run_id AND f.order_id = o.order_id
+                      LEFT JOIN strategy_lab.run_trade_fill a
+                        ON a.run_id = f.run_id AND a.fill_id = f.fill_id
+                      LEFT JOIN strategy_lab.run_trade t
+                        ON t.run_id = a.run_id AND t.trade_id = a.trade_id
+                      WHERE o.side = 'SELL' AND o.trade_id IS NULL
+                      GROUP BY o.run_id, o.order_id
+                    )
+                    SELECT COALESCE(jsonb_agg(to_jsonb(q)), '[]'::jsonb)
+                    FROM (
+                      SELECT COALESCE(r.strategy_commit, 'unknown') AS strategy_commit,
+                             COALESCE(r.backtest_commit, 'unknown') AS backtest_commit,
+                             count(*)::bigint AS sell_orders_missing_trade_id,
+                             count(*) FILTER (WHERE o.exit_event_id IS NOT NULL)::bigint AS with_exit_event_count,
+                             count(*) FILTER (WHERE o.exit_event_id IS NULL)::bigint AS without_exit_event_count,
+                             count(*) FILTER (WHERE s.fill_count > 0)::bigint AS with_fill_count,
+                             count(*) FILTER (WHERE s.fill_count = 0)::bigint AS without_fill_count,
+                             count(*) FILTER (WHERE s.allocated_trade_count = 1)::bigint AS exactly_one_allocated_trade_count,
+                             count(*) FILTER (WHERE s.allocated_trade_count = 0)::bigint AS without_allocated_trade_count,
+                             count(*) FILTER (WHERE s.allocated_trade_count > 1)::bigint AS multiple_allocated_trades_count,
+                             sum(s.allocated_security_mismatch_count)::bigint AS allocated_security_mismatch_count
+                      FROM strategy_lab.run_order o
+                      JOIN strategy_lab.experiment_run r ON r.run_id = o.run_id
+                      JOIN sell_trace s ON s.run_id = o.run_id AND s.order_id = o.order_id
+                      WHERE o.side = 'SELL' AND o.trade_id IS NULL
+                      GROUP BY r.strategy_commit, r.backtest_commit
+                    ) q
+                  ),
+                  'order_signal_mismatch_by_version', (
+                    SELECT COALESCE(jsonb_agg(to_jsonb(q)), '[]'::jsonb)
+                    FROM (
+                      SELECT COALESCE(r.strategy_commit, 'unknown') AS strategy_commit,
+                             COALESCE(r.backtest_commit, 'unknown') AS backtest_commit,
+                             o.side,
+                             count(*) FILTER (
+                               WHERE o.signal_id IS NOT NULL AND s.signal_id IS NULL
+                             )::bigint AS dangling_signal_reference_count,
+                             count(*) FILTER (
+                               WHERE s.signal_id IS NOT NULL
+                                 AND (o.exchange IS DISTINCT FROM s.exchange
+                                   OR o.canonical_id IS DISTINCT FROM s.canonical_id)
+                             )::bigint AS security_mismatch_count
+                      FROM strategy_lab.run_order o
+                      JOIN strategy_lab.experiment_run r ON r.run_id = o.run_id
+                      LEFT JOIN strategy_lab.run_signal s
+                        ON s.run_id = o.run_id AND s.signal_id = o.signal_id
+                      WHERE o.signal_id IS NOT NULL
+                      GROUP BY r.strategy_commit, r.backtest_commit, o.side
+                    ) q
+                  ),
+                  'allocation_security_mismatch_by_version', (
+                    SELECT COALESCE(jsonb_agg(to_jsonb(q)), '[]'::jsonb)
+                    FROM (
+                      SELECT COALESCE(r.strategy_commit, 'unknown') AS strategy_commit,
+                             COALESCE(r.backtest_commit, 'unknown') AS backtest_commit,
+                             a.allocation_role,
+                             count(*) FILTER (
+                               WHERE t.exchange IS DISTINCT FROM o.exchange
+                                  OR t.canonical_id IS DISTINCT FROM o.canonical_id
+                             )::bigint AS security_mismatch_count,
+                             count(*)::bigint AS allocation_count
+                      FROM strategy_lab.run_trade_fill a
+                      JOIN strategy_lab.run_trade t
+                        ON t.run_id = a.run_id AND t.trade_id = a.trade_id
+                      JOIN strategy_lab.run_fill f
+                        ON f.run_id = a.run_id AND f.fill_id = a.fill_id
+                      JOIN strategy_lab.run_order o
+                        ON o.run_id = f.run_id AND o.order_id = f.order_id
+                      JOIN strategy_lab.experiment_run r ON r.run_id = a.run_id
+                      GROUP BY r.strategy_commit, r.backtest_commit, a.allocation_role
+                    ) q
+                  ),
+                  'exit_event_by_version', (
+                    WITH event_trace AS (
+                      SELECT e.run_id, e.exit_event_id, e.status, e.reason, e.decision_date,
+                             count(o.order_id) FILTER (WHERE o.side = 'SELL')::bigint AS sell_order_count,
+                             count(o.order_id) FILTER (
+                               WHERE o.side = 'SELL' AND o.trade_id IS DISTINCT FROM e.trade_id
+                             )::bigint AS sell_order_trade_mismatch_count,
+                             count(o.order_id) FILTER (
+                               WHERE o.side = 'SELL' AND o.decision_reason IS DISTINCT FROM e.reason
+                             )::bigint AS sell_order_reason_mismatch_count,
+                             min(o.decision_date) FILTER (WHERE o.side = 'SELL') AS first_sell_decision_date,
+                             COALESCE(sum(o.filled_qty) FILTER (WHERE o.side = 'SELL'), 0)::bigint AS sell_filled_qty
+                      FROM strategy_lab.run_exit_event e
+                      LEFT JOIN strategy_lab.run_order o
+                        ON o.run_id = e.run_id AND o.exit_event_id = e.exit_event_id
+                      GROUP BY e.run_id, e.exit_event_id, e.status, e.reason, e.decision_date
+                    )
+                    SELECT COALESCE(jsonb_agg(to_jsonb(q)), '[]'::jsonb)
+                    FROM (
+                      SELECT COALESCE(r.strategy_commit, 'unknown') AS strategy_commit,
+                             COALESCE(r.backtest_commit, 'unknown') AS backtest_commit,
+                             e.status,
+                             count(*)::bigint AS exit_event_count,
+                             count(*) FILTER (WHERE e.sell_order_count = 0)::bigint AS without_sell_order_count,
+                             sum(e.sell_order_trade_mismatch_count)::bigint AS sell_order_trade_mismatch_count,
+                             sum(e.sell_order_reason_mismatch_count)::bigint AS sell_order_reason_mismatch_count,
+                             count(*) FILTER (
+                               WHERE e.first_sell_decision_date IS NOT NULL
+                                 AND to_char(e.first_sell_decision_date, 'YYYYMMDD')::integer
+                                     <> e.decision_date
+                             )::bigint AS first_sell_decision_date_mismatch_count,
+                             count(*) FILTER (
+                               WHERE e.status = 'complete' AND e.sell_filled_qty = 0
+                             )::bigint AS complete_without_sell_fill_count,
+                             count(*) FILTER (
+                               WHERE e.status = 'abandoned' AND e.sell_filled_qty > 0
+                             )::bigint AS abandoned_with_partial_or_prior_fill_count
+                      FROM event_trace e
+                      JOIN strategy_lab.experiment_run r ON r.run_id = e.run_id
+                      GROUP BY r.strategy_commit, r.backtest_commit, e.status
+                    ) q
+                  )
+                ) INTO diagnostics_report;
+
+                RAISE NOTICE 'STRATEGY_LAB_DIAGNOSTICS=%', diagnostics_report::text;
+              END
+              $strategy_lab_diagnostic_slices$;
+
               COMMIT;
               """
 
@@ -948,6 +1178,27 @@ jobs:
                   ) from exc
               if audit_report["consistency_audit"].get("schema_version") != 1:
                   raise SystemExit("FAIL: Strategy Lab consistency audit version mismatch")
+
+              diagnostics_marker = "STRATEGY_LAB_DIAGNOSTICS="
+              diagnostics_lines = [
+                  line for line in notice_output.splitlines()
+                  if diagnostics_marker in line
+              ]
+              if len(diagnostics_lines) != 1:
+                  raise SystemExit(
+                      "FAIL: Strategy Lab diagnostic slices were not emitted exactly once"
+                  )
+              try:
+                  diagnostics_payload = diagnostics_lines[0].split(
+                      diagnostics_marker, 1
+                  )[1].strip()
+                  audit_report["diagnostic_slices"] = json.loads(diagnostics_payload)
+              except Exception as exc:
+                  raise SystemExit(
+                      "FAIL: Strategy Lab diagnostic slices were invalid JSON"
+                  ) from exc
+              if audit_report["diagnostic_slices"].get("schema_version") != 1:
+                  raise SystemExit("FAIL: Strategy Lab diagnostic slices version mismatch")
               if not isinstance(audit_report["consistency_audit"].get("checks"), dict):
                   raise SystemExit("FAIL: Strategy Lab consistency checks must be an object")
 
