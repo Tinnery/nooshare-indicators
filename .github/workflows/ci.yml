@@ -513,6 +513,354 @@ jobs:
               END
               $strategy_lab_exact_counts$;
 
+              DO $strategy_lab_consistency$
+              DECLARE
+                consistency_report jsonb;
+              BEGIN
+                SELECT jsonb_build_object(
+                  'schema_version', 1,
+                  'status_distributions', jsonb_build_object(
+                    'experiment_run', (
+                      SELECT COALESCE(jsonb_object_agg(status, row_count), '{}'::jsonb)
+                      FROM (
+                        SELECT status, count(*)::bigint AS row_count
+                        FROM strategy_lab.experiment_run GROUP BY status
+                      ) q
+                    ),
+                    'run_trade', (
+                      SELECT COALESCE(jsonb_object_agg(status, row_count), '{}'::jsonb)
+                      FROM (
+                        SELECT status, count(*)::bigint AS row_count
+                        FROM strategy_lab.run_trade GROUP BY status
+                      ) q
+                    ),
+                    'run_order_side_status', (
+                      SELECT COALESCE(jsonb_object_agg(side || ':' || status, row_count), '{}'::jsonb)
+                      FROM (
+                        SELECT side, status, count(*)::bigint AS row_count
+                        FROM strategy_lab.run_order GROUP BY side, status
+                      ) q
+                    ),
+                    'run_exit_event', (
+                      SELECT COALESCE(jsonb_object_agg(status, row_count), '{}'::jsonb)
+                      FROM (
+                        SELECT status, count(*)::bigint AS row_count
+                        FROM strategy_lab.run_exit_event GROUP BY status
+                      ) q
+                    ),
+                    'run_package_schema_version', (
+                      SELECT COALESCE(jsonb_object_agg(schema_version::text, row_count), '{}'::jsonb)
+                      FROM (
+                        SELECT schema_version, count(*)::bigint AS row_count
+                        FROM strategy_lab.run_package GROUP BY schema_version
+                      ) q
+                    )
+                  ),
+                  'checks', jsonb_build_object(
+                    'trades_without_initial_signal', (
+                      SELECT count(*) FROM strategy_lab.run_trade
+                      WHERE initial_signal_id IS NULL
+                    ),
+                    'trades_initial_signal_instrument_mismatch', (
+                      SELECT count(*)
+                      FROM strategy_lab.run_trade t
+                      JOIN strategy_lab.run_signal s
+                        ON s.run_id = t.run_id AND s.signal_id = t.initial_signal_id
+                      WHERE t.exchange IS DISTINCT FROM s.exchange
+                         OR t.canonical_id IS DISTINCT FROM s.canonical_id
+                    ),
+                    'orders_without_trade_by_side', (
+                      SELECT COALESCE(jsonb_object_agg(side, row_count), '{}'::jsonb)
+                      FROM (
+                        SELECT side, count(*)::bigint AS row_count
+                        FROM strategy_lab.run_order
+                        WHERE trade_id IS NULL
+                        GROUP BY side
+                      ) q
+                    ),
+                    'orders_without_signal_by_side', (
+                      SELECT COALESCE(jsonb_object_agg(side, row_count), '{}'::jsonb)
+                      FROM (
+                        SELECT side, count(*)::bigint AS row_count
+                        FROM strategy_lab.run_order
+                        WHERE signal_id IS NULL
+                        GROUP BY side
+                      ) q
+                    ),
+                    'orders_signal_instrument_mismatch', (
+                      SELECT count(*)
+                      FROM strategy_lab.run_order o
+                      JOIN strategy_lab.run_signal s
+                        ON s.run_id = o.run_id AND s.signal_id = o.signal_id
+                      WHERE o.exchange IS DISTINCT FROM s.exchange
+                         OR o.canonical_id IS DISTINCT FROM s.canonical_id
+                    ),
+                    'orders_trade_instrument_mismatch', (
+                      SELECT count(*)
+                      FROM strategy_lab.run_order o
+                      JOIN strategy_lab.run_trade t
+                        ON t.run_id = o.run_id AND t.trade_id = o.trade_id
+                      WHERE o.exchange IS DISTINCT FROM t.exchange
+                         OR o.canonical_id IS DISTINCT FROM t.canonical_id
+                    ),
+                    'orders_with_dangling_exit_event', (
+                      SELECT count(*)
+                      FROM strategy_lab.run_order o
+                      LEFT JOIN strategy_lab.run_exit_event e
+                        ON e.run_id = o.run_id AND e.exit_event_id = o.exit_event_id
+                      WHERE o.exit_event_id IS NOT NULL AND e.exit_event_id IS NULL
+                    ),
+                    'orders_exit_event_trade_mismatch', (
+                      SELECT count(*)
+                      FROM strategy_lab.run_order o
+                      JOIN strategy_lab.run_exit_event e
+                        ON e.run_id = o.run_id AND e.exit_event_id = o.exit_event_id
+                      WHERE o.trade_id IS DISTINCT FROM e.trade_id
+                    ),
+                    'orders_exit_event_wrong_side_or_missing_trade', (
+                      SELECT count(*)
+                      FROM strategy_lab.run_order
+                      WHERE exit_event_id IS NOT NULL
+                        AND (side <> 'SELL' OR trade_id IS NULL)
+                    ),
+                    'terminal_exit_events_without_sell_order', (
+                      SELECT count(*)
+                      FROM strategy_lab.run_exit_event e
+                      WHERE e.status IN ('executed', 'partial', 'complete')
+                        AND NOT EXISTS (
+                          SELECT 1
+                          FROM strategy_lab.run_order o
+                          WHERE o.run_id = e.run_id
+                            AND o.exit_event_id = e.exit_event_id
+                            AND o.side = 'SELL'
+                        )
+                    ),
+                    'orders_filled_qty_vs_fill_sum_mismatch', (
+                      SELECT count(*)
+                      FROM strategy_lab.run_order o
+                      LEFT JOIN (
+                        SELECT run_id, order_id, sum(filled_qty)::bigint AS fill_qty
+                        FROM strategy_lab.run_fill
+                        GROUP BY run_id, order_id
+                      ) f ON f.run_id = o.run_id AND f.order_id = o.order_id
+                      WHERE o.filled_qty <> COALESCE(f.fill_qty, 0)
+                    ),
+                    'orders_fills_exceed_requested_qty', (
+                      SELECT count(*)
+                      FROM strategy_lab.run_order o
+                      JOIN (
+                        SELECT run_id, order_id, sum(filled_qty)::bigint AS fill_qty
+                        FROM strategy_lab.run_fill
+                        GROUP BY run_id, order_id
+                      ) f ON f.run_id = o.run_id AND f.order_id = o.order_id
+                      WHERE f.fill_qty > o.requested_qty
+                    ),
+                    'fills_without_trade_allocation', (
+                      SELECT count(*)
+                      FROM strategy_lab.run_fill f
+                      WHERE NOT EXISTS (
+                        SELECT 1 FROM strategy_lab.run_trade_fill a
+                        WHERE a.run_id = f.run_id AND a.fill_id = f.fill_id
+                      )
+                    ),
+                    'fills_underallocated_qty', (
+                      SELECT count(*)
+                      FROM (
+                        SELECT f.run_id, f.fill_id, f.filled_qty,
+                               COALESCE(sum(a.allocated_qty), 0)::bigint AS allocated_qty
+                        FROM strategy_lab.run_fill f
+                        LEFT JOIN strategy_lab.run_trade_fill a
+                          ON a.run_id = f.run_id AND a.fill_id = f.fill_id
+                        GROUP BY f.run_id, f.fill_id, f.filled_qty
+                        HAVING COALESCE(sum(a.allocated_qty), 0) < f.filled_qty
+                      ) q
+                    ),
+                    'fills_overallocated_qty', (
+                      SELECT count(*)
+                      FROM (
+                        SELECT f.run_id, f.fill_id, f.filled_qty,
+                               COALESCE(sum(a.allocated_qty), 0)::bigint AS allocated_qty
+                        FROM strategy_lab.run_fill f
+                        LEFT JOIN strategy_lab.run_trade_fill a
+                          ON a.run_id = f.run_id AND a.fill_id = f.fill_id
+                        GROUP BY f.run_id, f.fill_id, f.filled_qty
+                        HAVING COALESCE(sum(a.allocated_qty), 0) > f.filled_qty
+                      ) q
+                    ),
+                    'allocations_role_side_mismatch', (
+                      SELECT count(*)
+                      FROM strategy_lab.run_trade_fill a
+                      JOIN strategy_lab.run_fill f
+                        ON f.run_id = a.run_id AND f.fill_id = a.fill_id
+                      JOIN strategy_lab.run_order o
+                        ON o.run_id = f.run_id AND o.order_id = f.order_id
+                      WHERE (a.allocation_role = 'ENTRY' AND o.side <> 'BUY')
+                         OR (a.allocation_role = 'EXIT' AND o.side <> 'SELL')
+                    ),
+                    'allocations_trade_instrument_mismatch', (
+                      SELECT count(*)
+                      FROM strategy_lab.run_trade_fill a
+                      JOIN strategy_lab.run_trade t
+                        ON t.run_id = a.run_id AND t.trade_id = a.trade_id
+                      JOIN strategy_lab.run_fill f
+                        ON f.run_id = a.run_id AND f.fill_id = a.fill_id
+                      JOIN strategy_lab.run_order o
+                        ON o.run_id = f.run_id AND o.order_id = f.order_id
+                      WHERE t.exchange IS DISTINCT FROM o.exchange
+                         OR t.canonical_id IS DISTINCT FROM o.canonical_id
+                    ),
+                    'trade_entry_qty_vs_allocations_mismatch', (
+                      SELECT count(*)
+                      FROM strategy_lab.run_trade t
+                      LEFT JOIN (
+                        SELECT run_id, trade_id,
+                               sum(allocated_qty) FILTER (WHERE allocation_role = 'ENTRY')::bigint AS entry_allocated_qty
+                        FROM strategy_lab.run_trade_fill
+                        GROUP BY run_id, trade_id
+                      ) a ON a.run_id = t.run_id AND a.trade_id = t.trade_id
+                      WHERE t.entry_qty <> COALESCE(a.entry_allocated_qty, 0)
+                    ),
+                    'trade_exit_qty_vs_allocations_mismatch', (
+                      SELECT count(*)
+                      FROM strategy_lab.run_trade t
+                      LEFT JOIN (
+                        SELECT run_id, trade_id,
+                               sum(allocated_qty) FILTER (WHERE allocation_role = 'EXIT')::bigint AS exit_allocated_qty
+                        FROM strategy_lab.run_trade_fill
+                        GROUP BY run_id, trade_id
+                      ) a ON a.run_id = t.run_id AND a.trade_id = t.trade_id
+                      WHERE t.exit_qty <> COALESCE(a.exit_allocated_qty, 0)
+                    ),
+                    'closed_trades_exit_qty_differs_from_entry_qty', (
+                      SELECT count(*) FROM strategy_lab.run_trade
+                      WHERE status = 'CLOSED' AND exit_qty <> entry_qty
+                    ),
+                    'closed_trades_without_closed_date', (
+                      SELECT count(*) FROM strategy_lab.run_trade
+                      WHERE status = 'CLOSED' AND closed_date IS NULL
+                    ),
+                    'nonclosed_trades_with_closed_date', (
+                      SELECT count(*) FROM strategy_lab.run_trade
+                      WHERE status <> 'CLOSED' AND closed_date IS NOT NULL
+                    ),
+                    'trades_exit_qty_exceeds_entry_qty', (
+                      SELECT count(*) FROM strategy_lab.run_trade
+                      WHERE exit_qty > entry_qty
+                    ),
+                    'exit_event_decision_date_outside_yyyymmdd_range', (
+                      SELECT count(*) FROM strategy_lab.run_exit_event
+                      WHERE decision_date < 19000101 OR decision_date > 21001231
+                    ),
+                    'fills_before_order_date', (
+                      SELECT count(*)
+                      FROM strategy_lab.run_fill f
+                      JOIN strategy_lab.run_order o
+                        ON o.run_id = f.run_id AND o.order_id = f.order_id
+                      WHERE f.fill_date < o.order_date
+                    ),
+                    'fills_before_order_decision_date', (
+                      SELECT count(*)
+                      FROM strategy_lab.run_fill f
+                      JOIN strategy_lab.run_order o
+                        ON o.run_id = f.run_id AND o.order_id = f.order_id
+                      WHERE f.fill_date < o.decision_date
+                    ),
+                    'trades_opened_date_vs_first_entry_fill_mismatch', (
+                      SELECT count(*)
+                      FROM strategy_lab.run_trade t
+                      JOIN (
+                        SELECT a.run_id, a.trade_id, min(f.fill_date) AS first_entry_fill_date
+                        FROM strategy_lab.run_trade_fill a
+                        JOIN strategy_lab.run_fill f
+                          ON f.run_id = a.run_id AND f.fill_id = a.fill_id
+                        WHERE a.allocation_role = 'ENTRY'
+                        GROUP BY a.run_id, a.trade_id
+                      ) x ON x.run_id = t.run_id AND x.trade_id = t.trade_id
+                      WHERE t.opened_date <> x.first_entry_fill_date
+                    ),
+                    'closed_trades_closed_date_vs_last_exit_fill_mismatch', (
+                      SELECT count(*)
+                      FROM strategy_lab.run_trade t
+                      JOIN (
+                        SELECT a.run_id, a.trade_id, max(f.fill_date) AS last_exit_fill_date
+                        FROM strategy_lab.run_trade_fill a
+                        JOIN strategy_lab.run_fill f
+                          ON f.run_id = a.run_id AND f.fill_id = a.fill_id
+                        WHERE a.allocation_role = 'EXIT'
+                        GROUP BY a.run_id, a.trade_id
+                      ) x ON x.run_id = t.run_id AND x.trade_id = t.trade_id
+                      WHERE t.status = 'CLOSED'
+                        AND t.closed_date IS DISTINCT FROM x.last_exit_fill_date
+                    ),
+                    'run_summary_count_mismatch', (
+                      SELECT count(*)
+                      FROM strategy_lab.run_summary s
+                      WHERE s.n_signals <> (
+                          SELECT count(*) FROM strategy_lab.run_signal x WHERE x.run_id = s.run_id
+                        )
+                         OR s.n_orders <> (
+                          SELECT count(*) FROM strategy_lab.run_order x WHERE x.run_id = s.run_id
+                        )
+                         OR s.n_fills <> (
+                          SELECT count(*) FROM strategy_lab.run_fill x WHERE x.run_id = s.run_id
+                        )
+                         OR s.n_trades <> (
+                          SELECT count(*) FROM strategy_lab.run_trade x WHERE x.run_id = s.run_id
+                        )
+                    ),
+                    'runs_missing_summary', (
+                      SELECT count(*)
+                      FROM strategy_lab.experiment_run r
+                      WHERE NOT EXISTS (
+                        SELECT 1 FROM strategy_lab.run_summary s WHERE s.run_id = r.run_id
+                      )
+                    ),
+                    'runs_missing_package', (
+                      SELECT count(*)
+                      FROM strategy_lab.experiment_run r
+                      WHERE NOT EXISTS (
+                        SELECT 1 FROM strategy_lab.run_package p WHERE p.run_id = r.run_id
+                      )
+                    ),
+                    'summary_missing_package', (
+                      SELECT count(*)
+                      FROM strategy_lab.run_summary s
+                      WHERE NOT EXISTS (
+                        SELECT 1 FROM strategy_lab.run_package p WHERE p.run_id = s.run_id
+                      )
+                    ),
+                    'package_missing_summary', (
+                      SELECT count(*)
+                      FROM strategy_lab.run_package p
+                      WHERE NOT EXISTS (
+                        SELECT 1 FROM strategy_lab.run_summary s WHERE s.run_id = p.run_id
+                      )
+                    ),
+                    'equity_total_asset_arithmetic_mismatch', (
+                      SELECT count(*)
+                      FROM strategy_lab.run_equity_point
+                      WHERE abs(total_asset - (cash + market_value)) > 0.00000001
+                    ),
+                    'summary_vs_last_equity_return_mismatch', (
+                      SELECT count(*)
+                      FROM strategy_lab.run_summary s
+                      JOIN LATERAL (
+                        SELECT cumulative_return
+                        FROM strategy_lab.run_equity_point e
+                        WHERE e.run_id = s.run_id
+                        ORDER BY e.date DESC
+                        LIMIT 1
+                      ) e ON true
+                      WHERE s.total_return IS NOT NULL
+                        AND abs(s.total_return - e.cumulative_return) > 0.00000001
+                    )
+                  )
+                ) INTO consistency_report;
+
+                RAISE NOTICE 'STRATEGY_LAB_CONSISTENCY=%', consistency_report::text;
+              END
+              $strategy_lab_consistency$;
+
               COMMIT;
               """
 
@@ -580,6 +928,29 @@ jobs:
               if not isinstance(audit_report["exact_table_counts"], list):
                   raise SystemExit("FAIL: Strategy Lab exact table counts must be a list")
 
+              consistency_marker = "STRATEGY_LAB_CONSISTENCY="
+              consistency_lines = [
+                  line for line in notice_output.splitlines()
+                  if consistency_marker in line
+              ]
+              if len(consistency_lines) != 1:
+                  raise SystemExit(
+                      "FAIL: Strategy Lab consistency audit was not emitted exactly once"
+                  )
+              try:
+                  consistency_payload = consistency_lines[0].split(
+                      consistency_marker, 1
+                  )[1].strip()
+                  audit_report["consistency_audit"] = json.loads(consistency_payload)
+              except Exception as exc:
+                  raise SystemExit(
+                      "FAIL: Strategy Lab consistency audit was invalid JSON"
+                  ) from exc
+              if audit_report["consistency_audit"].get("schema_version") != 1:
+                  raise SystemExit("FAIL: Strategy Lab consistency audit version mismatch")
+              if not isinstance(audit_report["consistency_audit"].get("checks"), dict):
+                  raise SystemExit("FAIL: Strategy Lab consistency checks must be an object")
+
               if audit_report.get("database") != "nooshare_dev":
                   raise SystemExit("FAIL: Strategy Lab audit database guard mismatch")
               if audit_report.get("transaction_read_only") != "on":
@@ -592,6 +963,13 @@ jobs:
               )
               table_count = len(audit_report.get("tables", []))
               exact_count_tables = len(audit_report.get("exact_table_counts", []))
+              consistency_checks = audit_report["consistency_audit"]["checks"]
+              print(f"Strategy Lab consistency checks emitted: {len(consistency_checks)}")
+              print(f"Orders with dangling exit event: {consistency_checks.get('orders_with_dangling_exit_event')}")
+              print(f"Order/fill quantity mismatches: {consistency_checks.get('orders_filled_qty_vs_fill_sum_mismatch')}")
+              print(f"Fill allocation under/over-count: {consistency_checks.get('fills_underallocated_qty')}/{consistency_checks.get('fills_overallocated_qty')}")
+              print(f"Trade entry/exit allocation mismatches: {consistency_checks.get('trade_entry_qty_vs_allocations_mismatch')}/{consistency_checks.get('trade_exit_qty_vs_allocations_mismatch')}")
+              print(f"Run summary count mismatches: {consistency_checks.get('run_summary_count_mismatch')}")
               print("Strategy Lab DEV metadata audit: PASS (read-only)")
               print(f"Strategy Lab tables discovered: {table_count}")
               print(f"Strategy Lab exact table counts: {exact_count_tables}")
