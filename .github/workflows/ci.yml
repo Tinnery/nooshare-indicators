@@ -21,8 +21,87 @@ on:
         default: ""
         required: false
 
+  issue_comment:
+    types: [created]
+
 jobs:
+  validate_dispatch_request:
+    if: >-
+      github.event_name == 'issue_comment' &&
+      github.event.action == 'created' &&
+      github.ref == 'refs/heads/main' &&
+      github.event.issue.pull_request == null &&
+      github.event.comment.user.id == 284679775 &&
+      startsWith(github.event.comment.body, '/nooshare-ci ')
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    outputs:
+      infra_probe: ${{ steps.validate.outputs.infra_probe }}
+      workspace_source_export: ${{ steps.validate.outputs.workspace_source_export }}
+      workspace_source_ref: ${{ steps.validate.outputs.workspace_source_ref }}
+    steps:
+      - name: Validate owner-issued CI request
+        id: validate
+        env:
+          REQUEST_BODY: ${{ github.event.comment.body }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import re
+
+          body = os.environ.get("REQUEST_BODY", "")
+          prefix = "/nooshare-ci "
+          if not body.startswith(prefix):
+              raise SystemExit("Rejected: request command prefix is missing")
+
+          try:
+              request = json.loads(body[len(prefix):])
+          except json.JSONDecodeError as exc:
+              raise SystemExit("Rejected: request JSON is invalid") from exc
+
+          if not isinstance(request, dict):
+              raise SystemExit("Rejected: request must be a JSON object")
+
+          allowed = {
+              "infra_probe",
+              "workspace_source_export",
+              "workspace_source_ref",
+          }
+          unknown = set(request) - allowed
+          if unknown:
+              raise SystemExit("Rejected: unsupported request field(s)")
+
+          infra_probe = request.get("infra_probe", False)
+          source_export = request.get("workspace_source_export", False)
+          source_ref = request.get("workspace_source_ref", "")
+
+          if type(infra_probe) is not bool or type(source_export) is not bool:
+              raise SystemExit("Rejected: task flags must be booleans")
+          if not isinstance(source_ref, str):
+              raise SystemExit("Rejected: workspace_source_ref must be a string")
+          if source_export:
+              if not re.fullmatch(r"[0-9a-f]{40}", source_ref):
+                  raise SystemExit("Rejected: source export requires an exact 40-character commit SHA")
+          elif source_ref:
+              raise SystemExit("Rejected: source_ref is only valid when source export is enabled")
+
+          if not infra_probe and not source_export:
+              raise SystemExit("Rejected: no CI task was requested")
+
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              output.write(f"infra_probe={str(infra_probe).lower()}\\n")
+              output.write(f"workspace_source_export={str(source_export).lower()}\\n")
+              output.write(f"workspace_source_ref={source_ref}\\n")
+
+          print("Accepted owner-issued CI request")
+          print(f"infra_probe={infra_probe}")
+          print(f"workspace_source_export={source_export}")
+          print(f"workspace_source_ref_set={bool(source_ref)}")
+          PY
+
   test:
+    if: github.event_name != 'issue_comment'
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -44,7 +123,12 @@ jobs:
 
   pro_infrastructure_tunnel:
     name: CI Infrastructure Tunnel (read-only probe)
-    if: github.event_name == 'workflow_dispatch' && inputs.infra_probe == true && github.ref == 'refs/heads/main'
+    needs: validate_dispatch_request
+    if: >-
+      always() && (
+        (github.event_name == 'workflow_dispatch' && inputs.infra_probe == true && github.ref == 'refs/heads/main') ||
+        (needs.validate_dispatch_request.result == 'success' && needs.validate_dispatch_request.outputs.infra_probe == 'true')
+      )
     runs-on: ubuntu-latest
     environment: ci-probe
     timeout-minutes: 10
@@ -218,14 +302,19 @@ jobs:
 
   workspace_source_export:
     name: Workspace Source Export
-    if: github.event_name == 'workflow_dispatch' && inputs.workspace_source_export == true
+    needs: validate_dispatch_request
+    if: >-
+      always() && (
+        (github.event_name == 'workflow_dispatch' && inputs.workspace_source_export == true) ||
+        (needs.validate_dispatch_request.result == 'success' && needs.validate_dispatch_request.outputs.workspace_source_export == 'true')
+      )
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
       - name: Check out the requested source revision
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.workspace_source_ref || github.sha }}
+          ref: ${{ (github.event_name == 'issue_comment' && needs.validate_dispatch_request.result == 'success' && needs.validate_dispatch_request.outputs.workspace_source_ref != '') && needs.validate_dispatch_request.outputs.workspace_source_ref || inputs.workspace_source_ref || github.sha }}
           fetch-depth: 0
 
       - name: Package tracked source, tests and fixtures
@@ -386,7 +475,7 @@ jobs:
   workspace_artifact_materialization:
     name: Workspace Artifact Materialization
     needs: workspace_source_export
-    if: needs.workspace_source_export.result == 'success'
+    if: always() && needs.workspace_source_export.result == 'success'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
