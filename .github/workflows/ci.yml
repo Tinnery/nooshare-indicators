@@ -90,9 +90,9 @@ jobs:
               raise SystemExit("Rejected: no CI task was requested")
 
           with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
-              output.write(f"infra_probe={str(infra_probe).lower()}\\n")
-              output.write(f"workspace_source_export={str(source_export).lower()}\\n")
-              output.write(f"workspace_source_ref={source_ref}\\n")
+              output.write(f"infra_probe={str(infra_probe).lower()}\n")
+              output.write(f"workspace_source_export={str(source_export).lower()}\n")
+              output.write(f"workspace_source_ref={source_ref}\n")
 
           print("Accepted owner-issued CI request")
           print(f"infra_probe={infra_probe}")
