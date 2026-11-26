@@ -70,33 +70,38 @@ def volume_ratio(volume: pd.Series, period: int = 5) -> pd.Series:
 
 
 def volume_zscore(volume: pd.Series, period: int) -> pd.Series:
-    """
-    Volume Z-Score.
+    """Volume Z-Score（已接受研究口径，V0.5 修正）。
 
-    Z = (volume - mean(volume, period)) / std(volume, period)
+    Z(T) = (volume(T) - mean(有效观察 T-W..T-1)) / std(T-W..T-1, ddof=1)
 
-    Measures how many standard deviations current volume is from the mean.
-    
-    Uses sample standard deviation (ddof=1) for unbiased estimation.
-    Returns NaN when standard deviation is zero or window is insufficient.
+    与旧实现（volume.rolling(period)）的差异：
+    - 基准窗口 **不包含 T 日**：T 是被评价的当前观测，不能进入自己的基准；
+    - 停牌/无效零成交观察不进入基准窗口（volume <= 0 视为无效）；
+    - 仍用 ddof=1 样本标准差；窗口不足（有效观察 < period）返回 NaN；
+    - std=0 或 inf 返回 NaN。
 
     Args:
-        volume: Volume series
-        period: Rolling window size
+        volume: 原始成交量序列（不调整复权因子）
+        period: 基准窗口长度 W（T 之前的有效观察数）
 
     Returns:
-        Volume Z-Score series
+        Z-score 序列，index 与输入一致。
     """
-    rolling_mean = volume.rolling(window=period, min_periods=period).mean()
-    rolling_std = volume.rolling(window=period, min_periods=period).std(ddof=1)
-    
-    # Compute Z-score, handling zero std and invalid values
-    zscore = (volume - rolling_mean) / rolling_std
-    
-    # Replace inf/-inf with NaN (zero std case)
-    zscore = zscore.replace([np.inf, -np.inf], np.nan)
-    
-    return zscore
+    out = pd.Series(np.nan, index=volume.index, dtype=float)
+    values = volume.to_numpy(dtype=float)
+    for i in range(period, len(values)):
+        window = values[i - period:i]
+        valid = window[window > 0]
+        if len(valid) < period:
+            continue
+        std = valid.std(ddof=1)
+        if not np.isfinite(std) or std == 0:
+            continue
+        current = values[i]
+        if not np.isfinite(current) or current <= 0:
+            continue  # T 日无效观察不产生信号
+        out.iloc[i] = (current - valid.mean()) / std
+    return out.replace([np.inf, -np.inf], np.nan)
 
 
 def turnover_zscore(
