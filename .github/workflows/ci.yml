@@ -555,8 +555,12 @@ jobs:
                   raise SystemExit("FAIL: Strategy Lab audit returned invalid JSON") from exc
 
               exact_counts_marker = "STRATEGY_LAB_EXACT_TABLE_COUNTS="
+              notice_output = "\n".join([
+                  audit_result.stdout or "",
+                  audit_result.stderr or "",
+              ])
               exact_count_lines = [
-                  line for line in (audit_result.stderr or "").splitlines()
+                  line for line in notice_output.splitlines()
                   if exact_counts_marker in line
               ]
               if len(exact_count_lines) != 1:
