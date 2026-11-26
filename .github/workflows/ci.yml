@@ -359,6 +359,22 @@ jobs:
                   ]::text[]) AS t(table_name)
                   WHERE to_regclass('strategy_lab.' || quote_ident(t.table_name)) IS NOT NULL
                 ),
+                'table_privileges', (
+                  SELECT COALESCE(jsonb_agg(jsonb_build_object(
+                    'table', c.relname,
+                    'select', has_table_privilege(current_user, c.oid, 'SELECT'),
+                    'insert', has_table_privilege(current_user, c.oid, 'INSERT'),
+                    'update', has_table_privilege(current_user, c.oid, 'UPDATE'),
+                    'delete', has_table_privilege(current_user, c.oid, 'DELETE'),
+                    'truncate', has_table_privilege(current_user, c.oid, 'TRUNCATE'),
+                    'references', has_table_privilege(current_user, c.oid, 'REFERENCES'),
+                    'trigger', has_table_privilege(current_user, c.oid, 'TRIGGER')
+                  ) ORDER BY c.relname), '[]'::jsonb)
+                  FROM pg_class c
+                  JOIN pg_namespace n ON n.oid = c.relnamespace
+                  WHERE n.nspname = 'strategy_lab'
+                    AND c.relkind IN ('r', 'p')
+                ),
                 'columns', (
                   SELECT COALESCE(jsonb_agg(jsonb_build_object(
                     'table', c.relname,
