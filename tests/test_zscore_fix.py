@@ -20,23 +20,15 @@ class TestRollingZscore:
         return pd.Series(values, dtype=float)
 
     def test_ddof1_matches_hand_calculation(self):
-        """Rolling std must use ddof=1 (sample std)."""
+        """Rolling std uses ddof=1 on the W observations strictly before T."""
         from nooshare_indicators.indicators.volume import volume_zscore
 
-        # 5 values: [2, 4, 6, 8, 10]
-        # With window=3, at index 2: values=[2,4,6], mean=4, std(ddof=1)=2
-        # zscore = (6 - 4) / 2 = 1.0
         vol = self._make_series([2, 4, 6, 8, 10])
         result = volume_zscore(vol, period=3)
 
-        # At index 2: window=[2,4,6], mean=4, std(ddof=1)=2, z=(6-4)/2=1.0
-        assert abs(result.iloc[2] - 1.0) < 1e-10
-
-        # At index 3: window=[4,6,8], mean=6, std(ddof=1)=2, z=(8-6)/2=1.0
-        assert abs(result.iloc[3] - 1.0) < 1e-10
-
-        # At index 4: window=[6,8,10], mean=8, std(ddof=1)=2, z=(10-8)/2=1.0
-        assert abs(result.iloc[4] - 1.0) < 1e-10
+        assert result.iloc[:3].isna().all()
+        assert abs(result.iloc[3] - 2.0) < 1e-10
+        assert abs(result.iloc[4] - 2.0) < 1e-10
 
     def test_window_insufficient_returns_nan(self):
         """Must return NaN when fewer than `period` observations."""
@@ -48,16 +40,15 @@ class TestRollingZscore:
         # All values should be NaN (only 3 observations, need 5)
         assert result.isna().all()
 
-    def test_current_day_included_in_window(self):
-        """T day must be included in the rolling window."""
+    def test_current_day_excluded_from_baseline(self):
+        """T is scored against the preceding W valid observations, not itself."""
         from nooshare_indicators.indicators.volume import volume_zscore
 
         vol = self._make_series([10, 20, 30, 40, 50])
         result = volume_zscore(vol, period=3)
 
-        # At index 2: window=[10,20,30], mean=20, std(ddof=1)=10
-        # z = (30 - 20) / 10 = 1.0
-        assert abs(result.iloc[2] - 1.0) < 1e-10
+        assert result.iloc[:3].isna().all()
+        assert abs(result.iloc[3] - 2.0) < 1e-10
 
     def test_no_lookahead(self):
         """T+1 data must not affect T result."""
@@ -69,8 +60,7 @@ class TestRollingZscore:
         result_base = volume_zscore(vol_base, period=3)
         result_changed = volume_zscore(vol_changed, period=3)
 
-        # Index 2 should be identical (T+1 change at index 4 shouldn't affect it)
-        assert abs(result_base.iloc[2] - result_changed.iloc[2]) < 1e-10
+        assert abs(result_base.iloc[3] - result_changed.iloc[3]) < 1e-10
 
     def test_zero_std_returns_nan(self):
         """When all values in window are identical, std=0, zscore must be NaN."""
@@ -102,16 +92,15 @@ class TestRollingZscore:
         assert not np.isinf(result.dropna()).any()
 
     def test_different_periods(self):
-        """Different window lengths should all work correctly."""
+        """Different periods need W prior observations before first output."""
         from nooshare_indicators.indicators.volume import volume_zscore
 
-        vol = self._make_series(range(1, 21))  # 1..20
+        vol = self._make_series(range(1, 26))
         for period in [5, 10, 20]:
             result = volume_zscore(vol, period=period)
-            # First (period-1) values should be NaN
-            assert result.iloc[:period - 1].isna().all()
-            # From period-1 onward, should have valid values
-            assert result.iloc[period - 1:].notna().any()
+            assert result.iloc[:period].isna().all()
+            assert result.iloc[period:].notna().any()
+
 
 
 # ── Cross-sectional Z-score ──────────────────────────────────────────
