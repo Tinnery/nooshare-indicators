@@ -6,6 +6,23 @@ import pytest
 from scripts import backfill_zscore_2015 as backfill
 
 
+@pytest.fixture(autouse=True)
+def _synthetic_trading_calendar(monkeypatch):
+    # Synthetic fixtures use consecutive calendar dates as trading sessions.
+    monkeypatch.setattr(
+        backfill,
+        "get_trading_dates",
+        lambda start_date, end_date: [
+            int(value.strftime("%Y%m%d"))
+            for value in pd.date_range(
+                pd.to_datetime(str(start_date), format="%Y%m%d"),
+                pd.to_datetime(str(end_date), format="%Y%m%d"),
+                freq="D",
+            )
+        ],
+    )
+
+
 def test_dry_run_checks_target_table_with_select_only(monkeypatch):
     statements = []
 
@@ -194,10 +211,21 @@ def test_replace_stock_records_rejects_rows_outside_delete_scope(monkeypatch, re
 
 
 def _stock_frame(n=31):
+    dates = pd.date_range("2024-01-01", periods=n, freq="D")
+    close = [10.0 + i for i in range(n)]
     return pd.DataFrame({
-        "date": [20240101 + i for i in range(n)],
+        "symbol": ["sh600519"] * n,
+        "date": [int(value.strftime("%Y%m%d")) for value in dates],
+        "open": close,
+        "high": [value + 0.1 for value in close],
+        "low": [value - 0.1 for value in close],
+        "close": close,
+        "open_hfq": close,
+        "high_hfq": [value + 0.1 for value in close],
+        "low_hfq": [value - 0.1 for value in close],
+        "close_hfq": close,
         "volume": [100.0 + i for i in range(n)],
-        "close_hfq": [10.0 + i for i in range(n)],
+        "amount": [10_000.0 + i for i in range(n)],
     })
 
 
@@ -353,7 +381,7 @@ def test_close_history_insufficiency_does_not_clear_close_rows(monkeypatch):
     assert replacements[0][4] == result["eligible_indicators"]
 
 
-def test_close_history_with_gaps_does_not_clear_unrecomputable_series(monkeypatch):
+def test_close_history_with_missing_values_is_forward_filled_before_eligibility(monkeypatch):
     frame = _stock_frame(n=21)
     frame["close_hfq"] = [
         value if index % 2 == 0 else float("nan")
@@ -361,7 +389,6 @@ def test_close_history_with_gaps_does_not_clear_unrecomputable_series(monkeypatc
     ]
     replacements = []
     monkeypatch.setattr(backfill, "get_stock_data", lambda *args: frame)
-    monkeypatch.setattr(backfill, "compute_indicators_for_stock", _nan_indicator_series)
     monkeypatch.setattr(
         backfill,
         "replace_stock_records",
@@ -372,12 +399,39 @@ def test_close_history_with_gaps_does_not_clear_unrecomputable_series(monkeypatc
         "sh600519", 20240101, 20080101, 20240131, apply=True
     )
 
-    assert result["eligible_indicators"] == [
-        "volume_zscore_5",
-        "volume_zscore_10",
-        "volume_zscore_20",
-    ]
+    # The canonical compute path forward-fills aligned close-HFQ rows, so the
+    # backfill must recompute (and replace) those series rather than preserve/drop them.
+    assert result["eligible_indicators"] == list(backfill.TARGET_INDICATOR_NAMES)
     assert replacements[0][4] == result["eligible_indicators"]
+
+
+def test_missing_trading_session_is_recomputed_for_close_hfq_series(monkeypatch):
+    frame = _stock_frame(n=10)
+    frame = frame[frame["date"] != 20240106].reset_index(drop=True)
+    replacements = []
+    monkeypatch.setattr(backfill, "get_stock_data", lambda *args: frame)
+    monkeypatch.setattr(
+        backfill,
+        "replace_stock_records",
+        lambda *args: replacements.append(args),
+    )
+
+    result = backfill.backfill_stock(
+        "sh600519", 20240106, 20240101, 20240110, apply=True
+    )
+
+    assert result["status"] == "success"
+    assert result["replaced"] is True
+    # 2024-01-06 has no source row: align_with_calendar forward-fills close_hfq
+    # from 2024-01-05, so the five-row close rolling z-score is recomputed there.
+    gap_rows = [
+        record for record in replacements[0][3]
+        if record[1] == 20240106
+    ]
+    assert gap_rows == [
+        ("sh600519", 20240106, "close_hfq_rolling_zscore_5", pytest.approx(gap_rows[0][3]))
+    ]
+    assert len(gap_rows) == 1
 
 
 def test_no_source_rows_in_signal_range_never_clears_existing_rows(monkeypatch):
