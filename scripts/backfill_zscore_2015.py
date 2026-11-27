@@ -42,6 +42,10 @@ from nooshare_indicators.indicators.volume import volume_zscore
 SIGNAL_START_DATE = 20150101  # Only write signals from this date onwards
 PRE_WARM_START_DATE = 20080101  # Load data from this date for pre-warming
 PERIODS = [5, 10, 20]
+TARGET_INDICATOR_NAMES = tuple(
+    [f"volume_zscore_{period}" for period in PERIODS]
+    + [f"close_hfq_rolling_zscore_{period}" for period in PERIODS]
+)
 
 ENSURE_TABLE_SQL = """
 CREATE TABLE IF NOT EXISTS indicators.daily_ts_zscore (
@@ -159,17 +163,72 @@ def compute_indicators_for_stock(df: pd.DataFrame) -> dict[str, pd.Series]:
     return results
 
 
-def write_records(records: list[tuple]) -> None:
-    """Upsert records into indicators.daily_ts_zscore (parameterized)."""
+def replace_stock_records(
+    symbol: str,
+    start_date: int,
+    end_date: int,
+    records: list[tuple],
+    indicator_names: list[str] | None = None,
+) -> None:
+    """Atomically replace selected Z-score series in one stock/date range.
+
+    DELETE and INSERT share one transaction. This is intentionally a replacement,
+    not an UPSERT: rows whose new value is NaN are absent from records and must no
+    longer survive as stale values produced by an older formula. Series omitted
+    from indicator_names are outside the recomputation scope and remain untouched.
+    """
+    if start_date > end_date:
+        raise ValueError("start_date must be <= end_date")
+
+    target_names = tuple(
+        TARGET_INDICATOR_NAMES if indicator_names is None else indicator_names
+    )
+    if not target_names:
+        raise ValueError("at least one indicator name must be selected")
+    if len(set(target_names)) != len(target_names):
+        raise ValueError("indicator names must not contain duplicates")
+    if not set(target_names).issubset(TARGET_INDICATOR_NAMES):
+        raise ValueError("replacement includes an unowned indicator name")
+
+    allowed_names = set(target_names)
+    for record in records:
+        if len(record) != 4:
+            raise ValueError("each indicator record must contain code, date, name, value")
+        code, record_date, indicator_name, _value = record
+        if code != symbol:
+            raise ValueError("record symbol does not match replacement scope")
+        if not start_date <= int(record_date) <= end_date:
+            raise ValueError("record date is outside replacement scope")
+        if indicator_name not in allowed_names:
+            raise ValueError("record indicator is outside replacement scope")
+        if not np.isfinite(float(_value)):
+            raise ValueError("record value must be finite")
+
+    delete_query = """
+        DELETE FROM indicators.daily_ts_zscore
+        WHERE code = %s
+          AND date >= %s
+          AND date <= %s
+          AND indicator_name = ANY(%s)
+    """
     insert_query = """
         INSERT INTO indicators.daily_ts_zscore (code, date, indicator_name, value)
         VALUES (%s, %s, %s, %s)
-        ON CONFLICT (code, date, indicator_name) DO UPDATE SET value = EXCLUDED.value
     """
+
     with db.get_connection() as conn:
-        with conn.cursor() as cur:
-            cur.executemany(insert_query, records)
-        conn.commit()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    delete_query,
+                    (symbol, start_date, end_date, list(target_names)),
+                )
+                if records:
+                    cur.executemany(insert_query, records)
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
 
 
 def backfill_stock(
@@ -179,40 +238,125 @@ def backfill_stock(
     max_date: int,
     apply: bool,
 ) -> dict:
-    """Backfill indicators for a single stock."""
-    # Load data with pre-warm
-    df = get_stock_data(symbol, pre_warm_start_date, max_date)
+    """Rebuild one stock's target indicator rows within the requested date range.
 
-    if len(df) < max(PERIODS) + 1:
-        return {"symbol": symbol, "status": "skipped", "reason": "insufficient_data", "rows": 0}
-
-    # Compute indicators
-    indicators = compute_indicators_for_stock(df)
-
-    # Filter to signal dates only
-    signal_df = df[df["date"] >= signal_start_date].copy()
-
-    if len(signal_df) == 0:
-        return {"symbol": symbol, "status": "skipped", "reason": "no_signal_dates", "rows": 0}
-
-    # Build records for insertion
+    In apply mode, eligible series are replaced even when their newly computed
+    output is empty, clearing stale values that now correctly evaluate to NaN.
+    Series without sufficient source history are preserved.
+    """
+    # Normalize to positional indexing; indicator Series are aligned by row order.
+    df = get_stock_data(symbol, pre_warm_start_date, max_date).reset_index(drop=True)
     records = []
-    for _, row in signal_df.iterrows():
-        date = row["date"]
-        idx = df.index[df["date"] == date][0]
+    eligible_indicator_names: list[str] = []
+    skipped_indicator_names: list[str] = []
+    reason = None
 
-        for indicator_name, series in indicators.items():
-            value = series.iloc[idx] if idx < len(series) else np.nan
-            if pd.notna(value):
-                records.append((symbol, date, indicator_name, float(value)))
+    signal_df = df[df["date"] >= signal_start_date].copy()
+    if signal_df.empty:
+        # No source rows in the requested signal range is not evidence that old
+        # indicator rows are stale. Preserve the existing range instead of
+        # turning a source-coverage gap into a destructive empty replacement.
+        reason = "no_signal_dates"
+        skipped_indicator_names = list(TARGET_INDICATOR_NAMES)
+    else:
+        volume_values = pd.to_numeric(df["volume"], errors="coerce").to_numpy(
+            dtype=np.float64, na_value=np.nan
+        )
+        close_values = pd.to_numeric(df["close_hfq"], errors="coerce").to_numpy(
+            dtype=np.float64, na_value=np.nan
+        )
+        valid_volume_count = int(
+            np.count_nonzero(np.isfinite(volume_values) & (volume_values > 0))
+        )
+        close_validity = pd.Series(
+            np.isfinite(close_values), dtype=np.int64
+        )
+
+        # Eligibility is per series, not per maximum period. Volume Z-score
+        # needs W prior valid observations plus the current valid observation;
+        # close Z-score needs at least one complete W-row finite-price window.
+        for period in PERIODS:
+            volume_name = f"volume_zscore_{period}"
+            close_name = f"close_hfq_rolling_zscore_{period}"
+            if valid_volume_count > period:
+                eligible_indicator_names.append(volume_name)
+            else:
+                skipped_indicator_names.append(volume_name)
+
+            has_close_window = bool(
+                close_validity.rolling(
+                    window=period, min_periods=period
+                ).sum().ge(period).any()
+            )
+            if has_close_window:
+                eligible_indicator_names.append(close_name)
+            else:
+                skipped_indicator_names.append(close_name)
+
+        if eligible_indicator_names:
+            indicators = compute_indicators_for_stock(df)
+            for _, row in signal_df.iterrows():
+                record_date = int(row["date"])
+                positions = df.index[df["date"] == row["date"]]
+                if len(positions) != 1:
+                    raise ValueError(
+                        f"expected one source row for {symbol} {record_date}, "
+                        f"found {len(positions)}"
+                    )
+                position = int(positions[0])
+                for indicator_name in eligible_indicator_names:
+                    series = indicators[indicator_name]
+                    value = series.iloc[position] if position < len(series) else np.nan
+                    if pd.notna(value):
+                        records.append(
+                            (symbol, record_date, indicator_name, float(value))
+                        )
+            if skipped_indicator_names:
+                reason = "partial_history"
+        else:
+            reason = "insufficient_history"
 
     if not apply:
-        return {"symbol": symbol, "status": "dry_run", "rows": len(records)}
+        return {
+            "symbol": symbol,
+            "status": "dry_run",
+            "reason": reason,
+            "rows": len(records),
+            "replaced": False,
+            "eligible_indicators": eligible_indicator_names,
+            "skipped_indicators": skipped_indicator_names,
+        }
 
-    if records:
-        write_records(records)
+    if eligible_indicator_names:
+        # Replace only series whose source history is sufficient to recompute
+        # them. Empty output for an eligible series is meaningful (e.g. all
+        # values now NaN under the current formula) and clears its stale rows.
+        replace_stock_records(
+            symbol,
+            signal_start_date,
+            max_date,
+            records,
+            eligible_indicator_names,
+        )
+        return {
+            "symbol": symbol,
+            "status": "success",
+            "reason": reason,
+            "rows": len(records),
+            "replaced": True,
+            "eligible_indicators": eligible_indicator_names,
+            "skipped_indicators": skipped_indicator_names,
+        }
 
-    return {"symbol": symbol, "status": "success", "rows": len(records)}
+    return {
+        "symbol": symbol,
+        "status": "skipped",
+        "reason": reason,
+        "rows": 0,
+        "replaced": False,
+        "eligible_indicators": eligible_indicator_names,
+        "skipped_indicators": skipped_indicator_names,
+    }
 
 
 def main() -> None:
@@ -220,7 +364,7 @@ def main() -> None:
     parser.add_argument(
         "--apply",
         action="store_true",
-        help="Create required table/index and write records. Without this flag, perform a read-only dry-run.",
+        help="Create required table/index and atomically replace target indicator rows. Without this flag, perform a read-only dry-run.",
     )
     parser.add_argument("--start-date", type=int, default=SIGNAL_START_DATE, help="Signal start date")
     parser.add_argument("--max-date", type=int, default=None, help="Max date (default: latest in DB)")
