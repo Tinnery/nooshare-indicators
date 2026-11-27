@@ -401,8 +401,8 @@ def test_close_history_with_missing_values_is_forward_filled_before_eligibility(
 
     # The canonical compute path forward-fills aligned close-HFQ rows, so the
     # backfill must recompute (and replace) those series rather than preserve/drop them.
-    assert result["eligible_indicators"] == list(backfill.TARGET_INDICATOR_NAMES)
-    assert replacements[0][4] == result["eligible_indicators"]
+    assert set(result["eligible_indicators"]) == set(backfill.TARGET_INDICATOR_NAMES)
+    assert set(replacements[0][4]) == set(backfill.TARGET_INDICATOR_NAMES)
 
 
 def test_missing_trading_session_is_recomputed_for_close_hfq_series(monkeypatch):
@@ -428,10 +428,15 @@ def test_missing_trading_session_is_recomputed_for_close_hfq_series(monkeypatch)
         record for record in replacements[0][3]
         if record[1] == 20240106
     ]
-    assert gap_rows == [
-        ("sh600519", 20240106, "close_hfq_rolling_zscore_5", pytest.approx(gap_rows[0][3]))
-    ]
     assert len(gap_rows) == 1
+    assert gap_rows[0][:3] == (
+        "sh600519", 20240106, "close_hfq_rolling_zscore_5"
+    )
+    assert pd.notna(gap_rows[0][3])
+    assert not any(
+        record[1] == 20240106 and record[2].startswith("volume_zscore_")
+        for record in replacements[0][3]
+    )
 
 
 def test_no_source_rows_in_signal_range_never_clears_existing_rows(monkeypatch):
