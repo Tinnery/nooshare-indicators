@@ -115,23 +115,24 @@ def code_to_symbol(code: str) -> str:
 
 
 def load_stock_daily(symbol: str, start_date: Optional[int] = None) -> pd.DataFrame:
-    """Load daily OHLCV for a single stock from public.hfq_daily (后复权价格产品).
+    """Load daily OHLCV for a single stock from the unified interface.
     
-    使用 HFQ 价格(open_hfq, high_hfq, low_hfq, close_hfq)进行技术指标计算,
-    消除除权除息造成的机械性价格跳变。
-    同时保留原始价格(open, high, low, close)用于涨跌停判断等需要真实成交价格的场景。
+    使用 public.market_daily_adjusted_bar（P4 派生接口）+ 固定 factor_set_id，
+    HFQ 价格(open_hfq..close_hfq)消除除权跳变；Raw 价格与 volume/amount 保留。
+    口径与旧 public.hfq_daily 完全一致（DEV 2026-11-28 A/B 500股 0 mismatch）；
+    冻结：volume_zscore 等计算逻辑不改。
     """
     sql = """
     SELECT symbol, date, 
            open, high, low, close,
            open_hfq, high_hfq, low_hfq, close_hfq,
            volume, amount
-    FROM public.hfq_daily
-    WHERE symbol = %s AND date >= %s
+    FROM public.market_daily_adjusted_bar
+    WHERE symbol = %s AND date >= %s AND factor_set_id = %s
     ORDER BY date
     """
     start = start_date or config.MIN_DATE
-    df = db.read_sql(sql, (symbol, start))
+    df = db.read_sql(sql, (symbol, start, config.MARKET_FACTOR_SET_ID))
 
     # Convert date from integer to datetime
     df["date"] = pd.to_datetime(df["date"].astype(str), format="%Y%m%d")
@@ -145,7 +146,7 @@ def load_all_stocks_daily_batch(
     """
     Load daily data for all stocks in a single query (batch mode).
     
-    使用 HFQ 价格(open_hfq, high_hfq, low_hfq, close_hfq)进行技术指标计算。
+    使用 public.market_daily_adjusted_bar + 固定 factor_set_id（口径同 load_stock_daily）。
     Returns DataFrame with all stocks' data, much faster than individual queries.
     """
     # Convert codes to symbols
@@ -160,12 +161,12 @@ def load_all_stocks_daily_batch(
            open, high, low, close,
            open_hfq, high_hfq, low_hfq, close_hfq,
            volume, amount
-    FROM public.hfq_daily
-    WHERE symbol IN ({placeholders}) AND date >= %s
+    FROM public.market_daily_adjusted_bar
+    WHERE symbol IN ({placeholders}) AND date >= %s AND factor_set_id = %s
     ORDER BY symbol, date
     """
 
-    df = db.read_sql(sql, tuple(symbols) + (start,))
+    df = db.read_sql(sql, tuple(symbols) + (start, config.MARKET_FACTOR_SET_ID))
     
     # Convert date from integer to datetime
     df["date"] = pd.to_datetime(df["date"].astype(str), format="%Y%m%d")
