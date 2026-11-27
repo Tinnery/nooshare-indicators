@@ -14,105 +14,70 @@ import pytest
 # ── Rolling Z-score ──────────────────────────────────────────────────
 
 class TestRollingZscore:
-    """Test volume_zscore() contract."""
+    """Volume zscore: T 之前 W 个有效观察为基准，ddof=1，T 不进入窗口。"""
 
     def _make_series(self, values):
         return pd.Series(values, dtype=float)
 
     def test_ddof1_matches_hand_calculation(self):
-        """Rolling std must use ddof=1 (sample std)."""
+        """index4(40): 基准=[10,20,30] mean=20 std=10 -> z=(40-20)/10=2.0"""
         from nooshare_indicators.indicators.volume import volume_zscore
-
-        # 5 values: [2, 4, 6, 8, 10]
-        # With window=3, at index 2: values=[2,4,6], mean=4, std(ddof=1)=2
-        # zscore = (6 - 4) / 2 = 1.0
-        vol = self._make_series([2, 4, 6, 8, 10])
+        vol = self._make_series([10.0, 20.0, 30.0, 40.0, 50.0])
         result = volume_zscore(vol, period=3)
-
-        # At index 2: window=[2,4,6], mean=4, std(ddof=1)=2, z=(6-4)/2=1.0
-        assert abs(result.iloc[2] - 1.0) < 1e-10
-
-        # At index 3: window=[4,6,8], mean=6, std(ddof=1)=2, z=(8-6)/2=1.0
-        assert abs(result.iloc[3] - 1.0) < 1e-10
-
-        # At index 4: window=[6,8,10], mean=8, std(ddof=1)=2, z=(10-8)/2=1.0
-        assert abs(result.iloc[4] - 1.0) < 1e-10
+        assert abs(result.iloc[3] - 2.0) < 1e-10
+        assert abs(result.iloc[4] - 2.0) < 1e-10  # [20,30,40] mean=30, T=50, z=(50-30)/10
 
     def test_window_insufficient_returns_nan(self):
-        """Must return NaN when fewer than `period` observations."""
         from nooshare_indicators.indicators.volume import volume_zscore
+        vol = self._make_series([100.0, 200.0, 300.0])
+        assert volume_zscore(vol, period=5).isna().all()
 
-        vol = self._make_series([100, 200, 300])
-        result = volume_zscore(vol, period=5)
-
-        # All values should be NaN (only 3 observations, need 5)
-        assert result.isna().all()
-
-    def test_current_day_included_in_window(self):
-        """T day must be included in the rolling window."""
+    def test_current_day_not_in_window(self):
+        """V0.5 修正：T 日不进入基准（旧实现的 test_current_day_included 已作废）。"""
         from nooshare_indicators.indicators.volume import volume_zscore
-
-        vol = self._make_series([10, 20, 30, 40, 50])
+        vol = self._make_series([10.0, 20.0, 30.0, 40.0, 50.0])
         result = volume_zscore(vol, period=3)
-
-        # At index 2: window=[10,20,30], mean=20, std(ddof=1)=10
-        # z = (30 - 20) / 10 = 1.0
-        assert abs(result.iloc[2] - 1.0) < 1e-10
+        # index3: 基准=[10,20,30], z=2.0；若含T则 z=1.0
+        assert abs(result.iloc[3] - 2.0) < 1e-10
 
     def test_no_lookahead(self):
-        """T+1 data must not affect T result."""
         from nooshare_indicators.indicators.volume import volume_zscore
-
-        vol_base = self._make_series([10, 20, 30, 40, 50])
-        vol_changed = self._make_series([10, 20, 30, 40, 999])
-
-        result_base = volume_zscore(vol_base, period=3)
-        result_changed = volume_zscore(vol_changed, period=3)
-
-        # Index 2 should be identical (T+1 change at index 4 shouldn't affect it)
-        assert abs(result_base.iloc[2] - result_changed.iloc[2]) < 1e-10
+        base = volume_zscore(self._make_series([10., 20., 30., 40., 50.]), 3)
+        changed = volume_zscore(self._make_series([10., 20., 30., 40., 999.]), 3)
+        # T=3 的基准=[10,20,30]，不受 index4 改动影响
+        assert abs(base.iloc[3] - changed.iloc[3]) < 1e-10
+        # index4 本身是被评价的 T 日，改动它会改变 z（这是正确的）
+        assert abs(base.iloc[4] - 2.0) < 1e-10
+        assert abs(changed.iloc[4] - 96.9) < 1e-10
 
     def test_zero_std_returns_nan(self):
-        """When all values in window are identical, std=0, zscore must be NaN."""
         from nooshare_indicators.indicators.volume import volume_zscore
-
-        vol = self._make_series([5, 5, 5, 5, 5])
-        result = volume_zscore(vol, period=3)
-
-        # All windows have std=0, so all zscores should be NaN
-        assert result.isna().all()
+        assert volume_zscore(self._make_series([5.]*6), 3).isna().all()
 
     def test_all_zero_window_returns_nan(self):
-        """All-zero window should return NaN, not 0 or inf."""
         from nooshare_indicators.indicators.volume import volume_zscore
+        assert volume_zscore(self._make_series([0.]*6), 3).isna().all()
 
-        vol = self._make_series([0, 0, 0, 0, 0])
+    def test_suspended_zero_excluded_from_window(self):
+        """停牌零成交不进入基准窗口。"""
+        from nooshare_indicators.indicators.volume import volume_zscore
+        vol = self._make_series([10., 0., 30., 40., 50., 60.])
         result = volume_zscore(vol, period=3)
-
-        assert result.isna().all()
+        # index5: 基准=[30,40,50] mean=40 std=10 -> z=(60-40)/10=2.0
+        assert abs(result.iloc[5] - 2.0) < 1e-10
 
     def test_no_inf_in_output(self):
-        """Output must never contain inf or -inf."""
         from nooshare_indicators.indicators.volume import volume_zscore
-
-        # Very small std scenario
-        vol = self._make_series([1.0, 1.0 + 1e-15, 1.0, 1.0, 1.0])
-        result = volume_zscore(vol, period=3)
-
+        result = volume_zscore(self._make_series([1., 1.+1e-15, 1., 1., 1.]), 3)
         assert not np.isinf(result.dropna()).any()
 
     def test_different_periods(self):
-        """Different window lengths should all work correctly."""
         from nooshare_indicators.indicators.volume import volume_zscore
-
-        vol = self._make_series(range(1, 21))  # 1..20
-        for period in [5, 10, 20]:
-            result = volume_zscore(vol, period=period)
-            # First (period-1) values should be NaN
-            assert result.iloc[:period - 1].isna().all()
-            # From period-1 onward, should have valid values
-            assert result.iloc[period - 1:].notna().any()
-
+        vol = self._make_series([10., 20., 30., 40., 50., 60., 70.])
+        for p in (2, 3, 4):
+            r = volume_zscore(vol, period=p)
+            assert r.iloc[:p].isna().all()
+            assert r.iloc[p:].notna().any()
 
 # ── Cross-sectional Z-score ──────────────────────────────────────────
 

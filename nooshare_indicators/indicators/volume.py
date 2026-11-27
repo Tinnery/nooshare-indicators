@@ -24,7 +24,7 @@ def vwap(
         period: Rolling window size
 
     Returns:
-        VWAP series
+        VW series
     """
     typical_price = (high + low + close) / 3
     cumulative_tp_vol = (typical_price * volume).rolling(window=period).sum()
@@ -70,33 +70,55 @@ def volume_ratio(volume: pd.Series, period: int = 5) -> pd.Series:
 
 
 def volume_zscore(volume: pd.Series, period: int) -> pd.Series:
-    """
-    Volume Z-Score.
+    """Volume Z-Score（研究口径，V0.7 修正）。
 
-    Z = (volume - mean(volume, period)) / std(volume, period)
+    Z(T) = (V_T - mean(V_{t-W:t-1})) / std(V_{t-W:t-1}, ddof=1)
 
-    Measures how many standard deviations current volume is from the mean.
-    
-    Uses sample standard deviation (ddof=1) for unbiased estimation.
-    Returns NaN when standard deviation is zero or window is insufficient.
+    定义：
+    - T 是被评价的当前观测，不参与自己的基准统计；
+    - 基准窗口是 T 之前最近 W 个**有效**历史成交量观察值；
+    - 停牌/零成交/NaN/inf 观察不进入基准窗口；
+    - 当前值无效（<=0, NaN, inf）时返回 NaN；
+    - 历史有效观察不足 W 个时返回 NaN；
+    - 标准差为 0 或 inf 时返回 NaN；
+    - 使用 ddof=1 样本标准差。
+
+    与 V0.5 实现的差异：
+    - V0.5 只检查固定前 period 个位置，停牌时有效数不足直接跳过；
+    - V0.7 向前搜索直到找到 period 个有效历史观察值。
 
     Args:
-        volume: Volume series
-        period: Rolling window size
+        volume: 原始成交量序列（不调整复权因子）
+        period: 基准窗口长度 W（T 之前的有效观察数）
 
     Returns:
-        Volume Z-Score series
+        Z-score 序列，index 与输入一致。
     """
-    rolling_mean = volume.rolling(window=period, min_periods=period).mean()
-    rolling_std = volume.rolling(window=period, min_periods=period).std(ddof=1)
+    out = pd.Series(np.nan, index=volume.index, dtype=float)
+    values = volume.to_numpy(dtype=float)
     
-    # Compute Z-score, handling zero std and invalid values
-    zscore = (volume - rolling_mean) / rolling_std
+    # 维护最近 period 个有效历史观察值的滑动窗口
+    history = []
     
-    # Replace inf/-inf with NaN (zero std case)
-    zscore = zscore.replace([np.inf, -np.inf], np.nan)
+    for i in range(len(values)):
+        current = values[i]
+        
+        # 当前值有效性检查
+        current_valid = np.isfinite(current) and current > 0
+        
+        # 计算 Z-score（使用历史窗口，不含当前值）
+        if current_valid and len(history) >= period:
+            hist_arr = np.array(history[-period:])
+            mean = hist_arr.mean()
+            std = hist_arr.std(ddof=1)
+            if np.isfinite(std) and std > 0:
+                out.iloc[i] = (current - mean) / std
+        
+        # 当前值有效时加入历史窗口（供后续计算使用）
+        if current_valid:
+            history.append(current)
     
-    return zscore
+    return out
 
 
 def turnover_zscore(
@@ -116,7 +138,7 @@ def turnover_zscore(
         period: Rolling window size
 
     Returns:
-        Turnover Z-Score series
+        Turnover Z-score series
     """
     turnover = volume / total_shares
     return volume_zscore(turnover, period)
