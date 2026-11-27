@@ -439,6 +439,29 @@ def test_missing_trading_session_is_recomputed_for_close_hfq_series(monkeypatch)
     )
 
 
+def test_apply_backfill_deletes_only_dates_inside_recomputed_calendar_span(monkeypatch):
+    frame = _stock_frame(n=10)
+    replacements = []
+    monkeypatch.setattr(backfill, "get_stock_data", lambda *args: frame)
+    monkeypatch.setattr(backfill, "compute_indicators_for_stock", _nan_indicator_series)
+    monkeypatch.setattr(
+        backfill,
+        "replace_stock_records",
+        lambda *args: replacements.append(args),
+    )
+
+    result = backfill.backfill_stock(
+        "sh600519", 20231220, 20080101, 20240131, apply=True
+    )
+
+    assert result["replaced"] is True
+    assert replacements[0][:3] == (
+        "sh600519",
+        20240101,
+        20240110,
+    )
+
+
 def test_no_source_rows_in_signal_range_never_clears_existing_rows(monkeypatch):
     frame = _stock_frame(n=21)
     replacements = []
