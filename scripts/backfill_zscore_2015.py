@@ -238,6 +238,7 @@ def backfill_stock(
     pre_warm_start_date: int,
     max_date: int,
     apply: bool,
+    trading_dates: list[int] | None = None,
 ) -> dict:
     """Rebuild one stock's target indicator rows within the requested date range.
 
@@ -269,14 +270,17 @@ def backfill_stock(
         elif source_dates.duplicated().any():
             raise ValueError(f"duplicate source dates for {symbol}; refusing replacement")
         else:
-            trading_dates = get_trading_dates(pre_warm_start_date, max_date)
-            if not trading_dates:
+            calendar_dates = (
+                get_trading_dates(pre_warm_start_date, max_date)
+                if trading_dates is None else trading_dates
+            )
+            if not calendar_dates:
                 reason = "no_trading_calendar"
                 skipped_indicator_names = list(TARGET_INDICATOR_NAMES)
             else:
                 calendar = pd.DataFrame({
                     "trade_date": pd.to_datetime(
-                        [str(int(value)) for value in trading_dates],
+                        [str(int(value)) for value in calendar_dates],
                         format="%Y%m%d",
                     )
                 })
@@ -453,10 +457,15 @@ def main() -> None:
     skip_count = 0
     start_time = time.time()
 
+    # Load the trading calendar once for the whole batch; do not issue one extra
+    # calendar query per symbol.
+    trading_dates = get_trading_dates(PRE_WARM_START_DATE, max_date)
+
     for i, symbol in enumerate(symbols):
         try:
             result = backfill_stock(
-                symbol, args.start_date, PRE_WARM_START_DATE, max_date, args.apply
+                symbol, args.start_date, PRE_WARM_START_DATE, max_date, args.apply,
+                trading_dates=trading_dates,
             )
 
             if result["status"] == "success":
