@@ -36,6 +36,7 @@ import pandas as pd
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from nooshare_indicators.infrastructure import database as db
+from nooshare_indicators.infrastructure.data_loader import align_with_calendar
 from nooshare_indicators.indicators.price_position import close_hfq_rolling_zscore
 from nooshare_indicators.indicators.volume import volume_zscore
 
@@ -240,81 +241,111 @@ def backfill_stock(
 ) -> dict:
     """Rebuild one stock's target indicator rows within the requested date range.
 
-    In apply mode, eligible series are replaced even when their newly computed
-    output is empty, clearing stale values that now correctly evaluate to NaN.
-    Series without sufficient source history are preserved.
+    The backfill uses the same trading-calendar alignment as the normal compute
+    pipeline. Missing trading sessions are forward-filled for Raw/HFQ prices and
+    receive volume=0 before indicators are computed. This is essential because
+    close-HFQ rolling scores are intentionally computed on those aligned sessions.
     """
-    # Normalize to positional indexing; indicator Series are aligned by row order.
-    df = get_stock_data(symbol, pre_warm_start_date, max_date).reset_index(drop=True)
+    raw_df = get_stock_data(symbol, pre_warm_start_date, max_date).reset_index(drop=True)
     records = []
     eligible_indicator_names: list[str] = []
     skipped_indicator_names: list[str] = []
     reason = None
+    df = raw_df
 
-    signal_df = df[df["date"] >= signal_start_date].copy()
-    if signal_df.empty:
-        # No source rows in the requested signal range is not evidence that old
-        # indicator rows are stale. Preserve the existing range instead of
-        # turning a source-coverage gap into a destructive empty replacement.
-        reason = "no_signal_dates"
+    if raw_df.empty:
+        reason = "no_source_data"
         skipped_indicator_names = list(TARGET_INDICATOR_NAMES)
     else:
-        volume_values = pd.to_numeric(df["volume"], errors="coerce").to_numpy(
-            dtype=np.float64, na_value=np.nan
+        source_dates = pd.to_numeric(raw_df["date"], errors="coerce")
+        has_signal_source = bool(
+            source_dates.between(signal_start_date, max_date, inclusive="both").any()
         )
-        close_values = pd.to_numeric(df["close_hfq"], errors="coerce").to_numpy(
-            dtype=np.float64, na_value=np.nan
-        )
-        valid_volume_count = int(
-            np.count_nonzero(np.isfinite(volume_values) & (volume_values > 0))
-        )
-        close_validity = pd.Series(
-            np.isfinite(close_values), dtype=np.int64
-        )
-
-        # Eligibility is per series, not per maximum period. Volume Z-score
-        # needs W prior valid observations plus the current valid observation;
-        # close Z-score needs at least one complete W-row finite-price window.
-        for period in PERIODS:
-            volume_name = f"volume_zscore_{period}"
-            close_name = f"close_hfq_rolling_zscore_{period}"
-            if valid_volume_count > period:
-                eligible_indicator_names.append(volume_name)
-            else:
-                skipped_indicator_names.append(volume_name)
-
-            has_close_window = bool(
-                close_validity.rolling(
-                    window=period, min_periods=period
-                ).sum().ge(period).any()
-            )
-            if has_close_window:
-                eligible_indicator_names.append(close_name)
-            else:
-                skipped_indicator_names.append(close_name)
-
-        if eligible_indicator_names:
-            indicators = compute_indicators_for_stock(df)
-            for _, row in signal_df.iterrows():
-                record_date = int(row["date"])
-                positions = df.index[df["date"] == row["date"]]
-                if len(positions) != 1:
-                    raise ValueError(
-                        f"expected one source row for {symbol} {record_date}, "
-                        f"found {len(positions)}"
-                    )
-                position = int(positions[0])
-                for indicator_name in eligible_indicator_names:
-                    series = indicators[indicator_name]
-                    value = series.iloc[position] if position < len(series) else np.nan
-                    if pd.notna(value):
-                        records.append(
-                            (symbol, record_date, indicator_name, float(value))
-                        )
-            if skipped_indicator_names:
-                reason = "partial_history"
+        if not has_signal_source:
+            # No source rows in the requested signal range is not evidence that
+            # old indicator rows are stale. Preserve the existing range.
+            reason = "no_signal_dates"
+            skipped_indicator_names = list(TARGET_INDICATOR_NAMES)
+        elif source_dates.duplicated().any():
+            raise ValueError(f"duplicate source dates for {symbol}; refusing replacement")
         else:
-            reason = "insufficient_history"
+            trading_dates = get_trading_dates(pre_warm_start_date, max_date)
+            if not trading_dates:
+                reason = "no_trading_calendar"
+                skipped_indicator_names = list(TARGET_INDICATOR_NAMES)
+            else:
+                calendar = pd.DataFrame({
+                    "trade_date": pd.to_datetime(
+                        [str(int(value)) for value in trading_dates],
+                        format="%Y%m%d",
+                    )
+                })
+                # Reuse the normal compute pipeline's exact alignment contract:
+                # missing sessions -> forward-filled prices and volume/amount=0.
+                df = align_with_calendar(raw_df, calendar, symbol)
+                df["date"] = pd.to_datetime(df["date"]).dt.strftime("%Y%m%d").astype(int)
+                signal_df = df[df["date"].between(
+                    signal_start_date, max_date, inclusive="both"
+                )].copy()
+
+                if signal_df.empty:
+                    reason = "no_signal_dates"
+                    skipped_indicator_names = list(TARGET_INDICATOR_NAMES)
+                else:
+                    volume_values = pd.to_numeric(
+                        df["volume"], errors="coerce"
+                    ).to_numpy(dtype=np.float64, na_value=np.nan)
+                    close_values = pd.to_numeric(
+                        df["close_hfq"], errors="coerce"
+                    ).to_numpy(dtype=np.float64, na_value=np.nan)
+                    valid_volume_count = int(
+                        np.count_nonzero(np.isfinite(volume_values) & (volume_values > 0))
+                    )
+                    close_validity = pd.Series(
+                        np.isfinite(close_values), dtype=np.int64
+                    )
+
+                    # Eligibility is per series, not per maximum period. Volume
+                    # needs W prior valid observations plus current T. Close-HFQ
+                    # needs one complete W-row window after normal calendar fill.
+                    for period in PERIODS:
+                        volume_name = f"volume_zscore_{period}"
+                        close_name = f"close_hfq_rolling_zscore_{period}"
+                        if valid_volume_count > period:
+                            eligible_indicator_names.append(volume_name)
+                        else:
+                            skipped_indicator_names.append(volume_name)
+
+                        has_close_window = bool(
+                            close_validity.rolling(
+                                window=period, min_periods=period
+                            ).sum().ge(period).any()
+                        )
+                        if has_close_window:
+                            eligible_indicator_names.append(close_name)
+                        else:
+                            skipped_indicator_names.append(close_name)
+
+                    if eligible_indicator_names:
+                        indicators = compute_indicators_for_stock(df)
+                        date_to_position = {
+                            int(date): position
+                            for position, date in enumerate(df["date"].tolist())
+                        }
+                        for _, row in signal_df.iterrows():
+                            record_date = int(row["date"])
+                            position = date_to_position[record_date]
+                            for indicator_name in eligible_indicator_names:
+                                series = indicators[indicator_name]
+                                value = series.iloc[position] if position < len(series) else np.nan
+                                if pd.notna(value):
+                                    records.append(
+                                        (symbol, record_date, indicator_name, float(value))
+                                    )
+                        if skipped_indicator_names:
+                            reason = "partial_history"
+                    else:
+                        reason = "insufficient_history"
 
     if not apply:
         return {
@@ -329,8 +360,8 @@ def backfill_stock(
 
     if eligible_indicator_names:
         # Replace only series whose source history is sufficient to recompute
-        # them. Empty output for an eligible series is meaningful (e.g. all
-        # values now NaN under the current formula) and clears its stale rows.
+        # them. Empty output for an eligible series is meaningful and clears
+        # stale values; missing sessions are present because df was calendar-aligned.
         replace_stock_records(
             symbol,
             signal_start_date,
