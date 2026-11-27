@@ -366,10 +366,16 @@ def backfill_stock(
         # Replace only series whose source history is sufficient to recompute
         # them. Empty output for an eligible series is meaningful and clears
         # stale values; missing sessions are present because df was calendar-aligned.
+        # Only replace the date interval that was actually materialized by
+        # calendar alignment and recomputed. The requested range can extend
+        # beyond a symbol's first/last available source session; deleting those
+        # unobserved edges would erase rows we did not regenerate.
+        replacement_start = int(signal_df["date"].min())
+        replacement_end = int(signal_df["date"].max())
         replace_stock_records(
             symbol,
-            signal_start_date,
-            max_date,
+            replacement_start,
+            replacement_end,
             records,
             eligible_indicator_names,
         )
