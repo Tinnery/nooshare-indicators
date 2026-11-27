@@ -3,7 +3,7 @@
 
 Indicators written:
   - volume_zscore_{5,10,20}          (from raw volume)
-  - close_hfq_rolling_zscore_{5,10,20} (from HFQ close, research basis per ADR-0001)
+  - close_hfq_rolling_zscore_{5,10,20} (from HFQ close, research basis)
 
 Behaviour:
   - DRY-RUN by default: computes indicators and reports row counts without
@@ -35,13 +35,16 @@ import pandas as pd
 # Add project root to path so the script runs without installation.
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+from nooshare_indicators.config import MARKET_FACTOR_SET_ID
 from nooshare_indicators.infrastructure import database as db
 from nooshare_indicators.infrastructure.data_loader import align_with_calendar
 from nooshare_indicators.indicators.price_position import close_hfq_rolling_zscore
 from nooshare_indicators.indicators.volume import volume_zscore
 
-SIGNAL_START_DATE = 20150101  # Only write signals from this date onwards
-PRE_WARM_START_DATE = 20080101  # Load data from this date for pre-warming
+FACTOR_SET_ID = MARKET_FACTOR_SET_ID
+# Start/end are derived from the adjusted view by default; callers may override.
+SIGNAL_START_DATE = None
+PRE_WARM_START_DATE = None
 PERIODS = [5, 10, 20]
 TARGET_INDICATOR_NAMES = tuple(
     [f"volume_zscore_{period}" for period in PERIODS]
@@ -88,13 +91,54 @@ def prepare_target_table(apply: bool) -> None:
 
 
 def get_pit_stocks() -> pd.DataFrame:
-    """Get all stocks with list/delist dates for PIT filtering."""
+    """Get stock identities that exist in the fixed adjusted view."""
     query = """
-        SELECT symbol, list_date, delist_date
-        FROM public.canonical_symbol
-        WHERE asset_class = 'stock' OR asset_class IS NULL
+        SELECT DISTINCT cs.symbol, cs.exchange, cs.code, cs.list_date, cs.delist_date
+        FROM public.canonical_symbol cs
+        WHERE cs.asset_class = 'stock'
+          AND EXISTS (
+              SELECT 1
+              FROM public.market_daily_adjusted_bar a
+              WHERE a.symbol = cs.symbol
+                AND a.factor_set_id = %s::uuid
+          )
+        ORDER BY cs.exchange, cs.code
     """
-    return db.read_sql(query)
+    return db.read_sql(query, (FACTOR_SET_ID,))
+
+
+def get_source_range() -> tuple[int, int]:
+    """Return actual min/max date available in the fixed adjusted view."""
+    df = db.read_sql(
+        """
+        SELECT MIN(date) AS min_date, MAX(date) AS max_date
+        FROM public.market_daily_adjusted_bar
+        WHERE factor_set_id = %s::uuid
+        """,
+        (FACTOR_SET_ID,),
+    )
+    if df.empty or pd.isna(df.iloc[0]["min_date"]):
+        raise RuntimeError("market_daily_adjusted_bar has no rows for factor_set_id")
+    return int(df.iloc[0]["min_date"]), int(df.iloc[0]["max_date"])
+
+
+def get_source_class_breakdown() -> pd.DataFrame:
+    """Report canonical asset classes present in the adjusted view.
+
+    Only asset_class='stock' is eligible; bstock/index/etf/unknown are excluded
+    explicitly and reported rather than silently dropped.
+    """
+    query = """
+        SELECT COALESCE(cs.asset_class, 'unknown') AS asset_class,
+               count(DISTINCT a.symbol) AS symbols
+        FROM (SELECT DISTINCT symbol FROM public.market_daily_adjusted_bar
+              WHERE factor_set_id = %s::uuid) a
+        LEFT JOIN (SELECT DISTINCT symbol, asset_class FROM public.canonical_symbol) cs
+          ON cs.symbol = a.symbol
+        GROUP BY 1
+        ORDER BY 2 DESC
+    """
+    return db.read_sql(query, (FACTOR_SET_ID,))
 
 
 def get_trading_dates(start_date: int, end_date: int) -> list[int]:
@@ -112,18 +156,24 @@ def get_trading_dates(start_date: int, end_date: int) -> list[int]:
 
 
 def get_stock_data(symbol: str, start_date: int, end_date: int) -> pd.DataFrame:
-    """Load HFQ daily data for one stock (parameterized; HFQ basis per ADR-0001)."""
+    """Load one stock from the fixed unified Adjusted VIEW."""
     query = """
-        SELECT symbol, date, open, high, low, close,
+        SELECT symbol, date,
+               open::double precision AS open,
+               high::double precision AS high,
+               low::double precision AS low,
+               close::double precision AS close,
                open_hfq, high_hfq, low_hfq, close_hfq,
-               volume, amount
-        FROM public.hfq_daily
+               volume::double precision AS volume,
+               amount::double precision AS amount
+        FROM public.market_daily_adjusted_bar
         WHERE symbol = %s
+          AND factor_set_id = %s::uuid
           AND date >= %s
           AND date <= %s
         ORDER BY date
     """
-    return db.read_sql(query, (symbol, start_date, end_date))
+    return db.read_sql(query, (symbol, FACTOR_SET_ID, start_date, end_date))
 
 
 def filter_stocks_by_date(stocks_df: pd.DataFrame, target_date: int) -> list[str]:
@@ -407,38 +457,55 @@ def main() -> None:
         action="store_true",
         help="Create required table/index and atomically replace target indicator rows. Without this flag, perform a read-only dry-run.",
     )
-    parser.add_argument("--start-date", type=int, default=SIGNAL_START_DATE, help="Signal start date")
-    parser.add_argument("--max-date", type=int, default=None, help="Max date (default: latest in DB)")
+    parser.add_argument("--start-date", type=int, default=None,
+                        help="Signal start date (default: earliest adjusted view date)")
+    parser.add_argument("--max-date", type=int, default=None,
+                        help="Max date (default: latest adjusted view date)")
     parser.add_argument("--symbols", nargs="*", help="Specific symbols to process")
     args = parser.parse_args()
 
     prepare_target_table(apply=args.apply)
 
-    max_date = args.max_date
-    if max_date is None:
-        df = db.read_sql("SELECT MAX(date) AS max_date FROM public.hfq_daily")
-        max_date = int(df["max_date"].iloc[0])
+    source_min_date, source_max_date = get_source_range()
+    start_date = args.start_date if args.start_date is not None else source_min_date
+    max_date = args.max_date if args.max_date is not None else source_max_date
+    pre_warm_start_date = source_min_date
+    if start_date < source_min_date or max_date > source_max_date or start_date > max_date:
+        raise ValueError(
+            f"requested range {start_date}-{max_date} outside adjusted source "
+            f"{source_min_date}-{source_max_date}"
+        )
 
     print("=== Backfill Z-score Indicators ===")
-    print(f"Signal start date: {args.start_date}")
-    print(f"Pre-warm start date: {PRE_WARM_START_DATE}")
+    print(f"Factor set id: {FACTOR_SET_ID}")
+    print(f"Adjusted source range: {source_min_date}-{source_max_date}")
+    print(f"Signal start date: {start_date}")
+    print(f"Pre-warm start date: {pre_warm_start_date} (source minimum; no earlier history)")
     print(f"Max date: {max_date}")
     print(f"Mode: {'APPLY (writes)' if args.apply else 'DRY-RUN (read-only, pass --apply to write)'}")
+    breakdown = get_source_class_breakdown()
+    print("Adjusted symbols by canonical asset_class (only stock eligible):")
+    for _, row in breakdown.iterrows():
+        print(f"  {row['asset_class']}: {int(row['symbols'])}")
     print()
 
     stocks_df = get_pit_stocks()
-    print(f"Total stocks in canonical_symbol: {len(stocks_df)}")
+    supported_symbols = set(stocks_df["symbol"].tolist())
+    print(f"Eligible canonical stocks in adjusted view: {len(stocks_df)}")
 
     if args.symbols:
-        symbols = args.symbols
-        print(f"Processing {len(symbols)} specific symbols")
+        symbols = [symbol for symbol in args.symbols if symbol in supported_symbols]
+        excluded_symbols = [symbol for symbol in args.symbols if symbol not in supported_symbols]
+        if excluded_symbols:
+            print(f"Excluded unsupported symbols ({len(excluded_symbols)}): {excluded_symbols[:20]}")
+        print(f"Processing {len(symbols)} specific supported symbols")
     else:
-        # Symbols that have data in the signal range (parameterized)
         query = """
-            SELECT DISTINCT symbol FROM public.hfq_daily
-            WHERE date >= %s AND date <= %s
+            SELECT DISTINCT symbol FROM public.market_daily_adjusted_bar
+            WHERE factor_set_id = %s::uuid
+              AND date >= %s AND date <= %s
         """
-        active_df = db.read_sql(query, (args.start_date, max_date))
+        active_df = db.read_sql(query, (FACTOR_SET_ID, start_date, max_date))
         active_symbols = set(active_df["symbol"].tolist())
 
         # PIT filter: must be listed before signal start
@@ -449,30 +516,37 @@ def main() -> None:
                 continue
             if pd.notna(row.get("delist_date")):
                 if pd.to_datetime(row["delist_date"]) < pd.to_datetime(
-                    str(args.start_date), format="%Y%m%d"
+                    str(start_date), format="%Y%m%d"
                 ):
                     continue
             symbols.append(sym)
 
-        print(f"Stocks with data in signal range: {len(symbols)}")
+        print(f"Stocks with adjusted data in signal range: {len(symbols)}")
 
     print()
 
     total_rows = 0
     success_count = 0
     skip_count = 0
+    error_count = 0
+    error_symbols: list[str] = []
+    reason_counts: dict[str, int] = {}
     start_time = time.time()
 
     # Load the trading calendar once for the whole batch; do not issue one extra
     # calendar query per symbol.
-    trading_dates = get_trading_dates(PRE_WARM_START_DATE, max_date)
+    trading_dates = get_trading_dates(pre_warm_start_date, max_date)
 
     for i, symbol in enumerate(symbols):
         try:
             result = backfill_stock(
-                symbol, args.start_date, PRE_WARM_START_DATE, max_date, args.apply,
+                symbol, start_date, pre_warm_start_date, max_date, args.apply,
                 trading_dates=trading_dates,
             )
+
+            reason = result.get("reason")
+            if reason:
+                reason_counts[reason] = reason_counts.get(reason, 0) + 1
 
             if result["status"] == "success":
                 success_count += 1
@@ -490,13 +564,14 @@ def main() -> None:
                     f"Progress: {i + 1}/{len(symbols)} "
                     f"({100 * (i + 1) / len(symbols):.1f}%) | "
                     f"Success: {success_count} | Skip: {skip_count} | "
-                    f"Rows: {total_rows:,} | "
+                    f"Errors: {error_count} | Rows: {total_rows:,} | "
                     f"ETA: {eta:.0f}s"
                 )
 
         except Exception as e:
-            print(f"Error processing {symbol}: {e}")
-            skip_count += 1
+            error_count += 1
+            error_symbols.append(symbol)
+            print(f"ERROR processing {symbol}: {e}")
             continue
 
     elapsed = time.time() - start_time
@@ -505,8 +580,17 @@ def main() -> None:
     print(f"Total stocks: {len(symbols)}")
     print(f"Success: {success_count}")
     print(f"Skipped: {skip_count}")
+    print(f"Errors: {error_count}")
+    if reason_counts:
+        print("Skip reasons:")
+        for reason, count in sorted(reason_counts.items(), key=lambda item: -item[1]):
+            print(f"  {reason}: {count}")
+    if error_symbols:
+        print(f"Failed symbols ({len(error_symbols)}): {error_symbols[:20]}")
     print(f"Total rows {'written' if args.apply else '(dry-run)'}: {total_rows:,}")
     print(f"Elapsed: {elapsed:.1f}s")
+    if error_count:
+        sys.exit(1)
 
 
 if __name__ == "__main__":
