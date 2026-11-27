@@ -6,7 +6,6 @@
 """
 import pandas as pd
 import numpy as np
-import psycopg2
 import sys
 
 DB_CONFIG = {
@@ -23,6 +22,36 @@ def compute_zscore_independent(series: pd.Series, window: int) -> pd.Series:
     result = (series - rolling_mean) / rolling_std.replace(0, np.nan)
     result = result.replace([np.inf, -np.inf], np.nan)
     return result
+
+def compute_volume_zscore_independent(series: pd.Series, window: int) -> pd.Series:
+    """Independent T-1 reference: score each valid T against prior W valid volumes.
+
+    This intentionally uses a straightforward positional loop rather than the
+    production vectorized implementation. Non-positive and non-finite values are
+    skipped as observations; they are not classified as suspension or source gaps.
+    """
+    if window < 1:
+        raise ValueError("window must be >= 1")
+
+    values = pd.to_numeric(series, errors="coerce").to_numpy(
+        dtype=np.float64, na_value=np.nan
+    )
+    result = np.full(len(values), np.nan, dtype=np.float64)
+    valid_positions = np.flatnonzero(np.isfinite(values) & (values > 0))
+
+    for valid_index in range(window, len(valid_positions)):
+        current_position = valid_positions[valid_index]
+        history_positions = valid_positions[valid_index - window : valid_index]
+        history = values[history_positions]
+        sample_std = float(np.std(history, ddof=1))
+        if not np.isfinite(sample_std) or sample_std <= 0:
+            continue
+        result[current_position] = (
+            values[current_position] - float(np.mean(history))
+        ) / sample_std
+
+    return pd.Series(result, index=series.index, name=series.name)
+
 
 def verify_stock(code: str, conn) -> dict:
     """验证单只股票：读取原始数据，独立计算，与 PG 对比"""
@@ -57,7 +86,7 @@ def verify_stock(code: str, conn) -> dict:
     # 独立计算 Z-score（保存到单独的 DataFrame，避免列名冲突）
     my_indicators = pd.DataFrame({"date": base["date"]})
     for period in [5, 10, 20]:
-        my_indicators[f"my_volume_zscore_{period}"] = compute_zscore_independent(base["volume"], period).values
+        my_indicators[f"my_volume_zscore_{period}"] = compute_volume_zscore_independent(base["volume"], period).values
         my_indicators[f"my_close_hfq_rolling_zscore_{period}"] = compute_zscore_independent(base["close_hfq"], period).values
     
     # 只比较 20250101 之后的数据
@@ -118,6 +147,8 @@ def verify_stock(code: str, conn) -> dict:
     }
 
 def main():
+    import psycopg2
+
     test_codes = ["sz002852", "sz002230", "sh688255", "sh600157", "sz300642"]
     
     print("=== Z-score 准确性验证（独立 Pandas vs PG） ===")
