@@ -321,7 +321,7 @@ def test_apply_backfill_replaces_only_series_with_sufficient_history(
             (
                 "sh600519",
                 20240101,
-                20240131,
+                int(frame["date"].max()),
                 [],
                 expected,
             )
