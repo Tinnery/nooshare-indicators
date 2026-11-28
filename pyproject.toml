@@ -34,3 +34,8 @@ target-version = "py310"
 [[tool.uv.index]]
 url = "https://pypi.org/simple/"
 default = true
+
+[dependency-groups]
+dev = [
+    "pytest>=9.2.0",
+]

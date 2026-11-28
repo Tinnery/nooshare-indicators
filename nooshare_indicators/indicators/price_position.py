@@ -192,26 +192,6 @@ def price_position_in_range(
     return (close - n_low) / (n_high - n_low)
 
 
-def close_hfq_rolling_zscore(close_hfq: pd.Series, period: int) -> pd.Series:
-    """
-    Rolling Z-score of HFQ close price.
-
-    Z = (close_hfq - rolling_mean) / rolling_std
-
-    Uses ddof=1 (sample std). Zero std returns NaN (not 0 or inf).
-
-    Args:
-        close_hfq: HFQ close prices
-        period: Rolling window size
-
-    Returns:
-        Rolling Z-score series
-    """
-    rolling_mean = close_hfq.rolling(window=period, min_periods=period).mean()
-    rolling_std = close_hfq.rolling(window=period, min_periods=period).std(ddof=1)
-    result = (close_hfq - rolling_mean) / rolling_std
-    # Replace inf/-inf with NaN (zero std case)
-    result = result.replace([np.inf, -np.inf], np.nan)
     return result
 
 
@@ -271,21 +251,35 @@ def compute_all_price_position(
 
 def close_hfq_rolling_zscore(close_hfq: pd.Series, period: int) -> pd.Series:
     """
-    后复权收盘价的 Rolling Z-score。
+    后复权收盘价的 Rolling Z-score（C2 语义：最近 N 个有效观察）。
     
-    Z = (close_hfq - mean(close_hfq, period)) / std(close_hfq, period)
+    只使用有效的收盘价观察（NaN 被排除），计算最近 period 个有效观察的 Z-score。
+    原始索引中无观察的日期返回 NaN。
+    
+    Z = (close_hfq - mean(valid_close, period)) / std(valid_close, period)
     
     Args:
-        close_hfq: 后复权收盘价序列
-        period: 滚动窗口大小
+        close_hfq: 后复权收盘价序列（可含 NaN）
+        period: 滚动窗口大小（有效观察数量）
     
     Returns:
-        Z-score 序列
+        Z-score 序列（原始索引，无观察日为 NaN）
     """
-    rolling_mean = close_hfq.rolling(window=period, min_periods=period).mean()
-    rolling_std = close_hfq.rolling(window=period, min_periods=period).std(ddof=1)
+    # 保存原始索引
+    original_index = close_hfq.index
     
-    zscore = (close_hfq - rolling_mean) / rolling_std
+    # 剔除 NaN，只保留有效观察
+    valid_close = close_hfq.dropna()
+    
+    # 在有效观察序列上计算 rolling zscore
+    rolling_mean = valid_close.rolling(window=period, min_periods=period).mean()
+    rolling_std = valid_close.rolling(window=period, min_periods=period).std(ddof=1)
+    
+    zscore = (valid_close - rolling_mean) / rolling_std
     zscore = zscore.replace([np.inf, -np.inf], np.nan)
     
-    return zscore
+    # reindex 回原始索引（无观察日自动为 NaN）
+    result = zscore.reindex(original_index)
+    
+    return result
+
