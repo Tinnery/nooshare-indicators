@@ -109,6 +109,11 @@ validate = [
     { name = "ta-lib" },
 ]
 
+[package.dev-dependencies]
+dev = [
+    { name = "pytest" },
+]
+
 [package.metadata]
 requires-dist = [
     { name = "numpy", specifier = ">=1.24" },
@@ -123,6 +128,9 @@ requires-dist = [
     { name = "typer", specifier = ">=0.9" },
 ]
 provides-extras = ["validate", "dev"]
+
+[package.metadata.requires-dev]
+dev = [{ name = "pytest", specifier = ">=9.2.0" }]
 
 [[package]]
 name = "numpy"
