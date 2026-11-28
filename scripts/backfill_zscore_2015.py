@@ -8,6 +8,16 @@ Indicators written:
 Behaviour:
   - DRY-RUN by default: computes indicators and reports row counts without
     writing anything. Pass --apply to actually write.
+  - Volume Z-score is computed on the calendar-aligned frame: missing
+    sessions receive volume=0 and volume_zscore() itself treats zero/non-
+    positive volumes as invalid observations, so aligned synthetic rows
+    never enter its history window.
+  - Close HFQ Z-score follows C2 semantics (recent N valid close
+    observations): it is computed directly from the raw Adjusted VIEW
+    observation series BEFORE any calendar forward-fill. Synthetic calendar
+    rows never enter its window, and only real observation dates can receive
+    a value. Invalid prices (non-finite, non-positive) are excluded before
+    computation; this is a price-validity rule, not a suspension fact.
   - All SQL is parameterized; no string interpolation of user input.
   - Database connection comes from the shared nooshare_indicators.config
     (PG_HOST / PG_PORT / PG_USER / PG_PASSWORD / PG_DATABASE / PG_SSLMODE
@@ -27,6 +37,7 @@ Usage:
 import argparse
 import sys
 import time
+import uuid
 from pathlib import Path
 
 import numpy as np
@@ -50,6 +61,13 @@ TARGET_INDICATOR_NAMES = tuple(
     [f"volume_zscore_{period}" for period in PERIODS]
     + [f"close_hfq_rolling_zscore_{period}" for period in PERIODS]
 )
+CLOSE_INDICATOR_NAMES = tuple(
+    f"close_hfq_rolling_zscore_{period}" for period in PERIODS
+)
+
+# Build identity for rows this script writes. Only series actually recomputed
+# by this run receive metadata; untouched/legacy rows keep NULL provenance.
+ALGORITHM_VERSION_CLOSE = "c2-effective-window-v1"
 
 ENSURE_TABLE_SQL = """
 CREATE TABLE IF NOT EXISTS indicators.daily_ts_zscore (
@@ -197,18 +215,33 @@ def filter_stocks_by_date(stocks_df: pd.DataFrame, target_date: int) -> list[str
     return stocks_df.loc[mask, "symbol"].tolist()
 
 
-def compute_indicators_for_stock(df: pd.DataFrame) -> dict[str, pd.Series]:
-    """Compute all rolling z-score indicators for a stock."""
+def compute_indicators_for_stock(
+    aligned_df: pd.DataFrame,
+    raw_close_hfq: pd.Series,
+) -> dict[str, pd.Series]:
+    """Compute all rolling z-score indicators for one stock.
+
+    Volume Z-score keeps the canonical aligned-calendar contract: missing
+    sessions receive volume=0 and volume_zscore() itself treats them as
+    invalid observations, so synthetic calendar rows never enter its
+    history window.
+
+    Close HFQ Z-score follows C2 semantics (recent N valid close
+    observations): it must be computed from the raw observation series
+    BEFORE any calendar forward-fill, so synthetic calendar rows never
+    enter its window. Callers must pass raw_close_hfq with invalid prices
+    (non-finite, non-positive) already marked as NaN.
+    """
     results = {}
 
-    # Volume Z-score (ddof=1)
+    # Volume Z-score (ddof=1) on the aligned frame.
     for period in PERIODS:
-        results[f"volume_zscore_{period}"] = volume_zscore(df["volume"], period)
+        results[f"volume_zscore_{period}"] = volume_zscore(aligned_df["volume"], period)
 
-    # Close HFQ Rolling Z-score (ddof=1)
+    # Close HFQ Rolling Z-score (ddof=1, C2) on raw observations only.
     for period in PERIODS:
         results[f"close_hfq_rolling_zscore_{period}"] = close_hfq_rolling_zscore(
-            df["close_hfq"], period
+            raw_close_hfq, period
         )
 
     return results
@@ -220,6 +253,9 @@ def replace_stock_records(
     end_date: int,
     records: list[tuple],
     indicator_names: list[str] | None = None,
+    factor_set_id: str | None = None,
+    algorithm_version: str | None = None,
+    build_id: str | None = None,
 ) -> None:
     """Atomically replace selected Z-score series in one stock/date range.
 
@@ -227,9 +263,20 @@ def replace_stock_records(
     not an UPSERT: rows whose new value is NaN are absent from records and must no
     longer survive as stale values produced by an older formula. Series omitted
     from indicator_names are outside the recomputation scope and remain untouched.
+
+    Build identity columns are written only when all three provenance values are
+    supplied; otherwise the new rows keep NULL metadata (no fabricated identity).
     """
     if start_date > end_date:
         raise ValueError("start_date must be <= end_date")
+
+    metadata_values = (factor_set_id, algorithm_version, build_id)
+    metadata_supplied = any(value is not None for value in metadata_values)
+    if metadata_supplied and any(value is None for value in metadata_values):
+        raise ValueError(
+            "build identity requires factor_set_id, algorithm_version and "
+            "build_id together; partial provenance would be misleading"
+        )
 
     target_names = tuple(
         TARGET_INDICATOR_NAMES if indicator_names is None else indicator_names
@@ -262,10 +309,18 @@ def replace_stock_records(
           AND date <= %s
           AND indicator_name = ANY(%s)
     """
-    insert_query = """
-        INSERT INTO indicators.daily_ts_zscore (code, date, indicator_name, value)
-        VALUES (%s, %s, %s, %s)
-    """
+    if metadata_supplied:
+        insert_query = """
+            INSERT INTO indicators.daily_ts_zscore
+                (code, date, indicator_name, value,
+                 factor_set_id, algorithm_version, build_id)
+            VALUES (%s, %s, %s, %s, %s::uuid, %s, %s::uuid)
+        """
+    else:
+        insert_query = """
+            INSERT INTO indicators.daily_ts_zscore (code, date, indicator_name, value)
+            VALUES (%s, %s, %s, %s)
+        """
 
     with db.get_connection() as conn:
         try:
@@ -275,7 +330,13 @@ def replace_stock_records(
                     (symbol, start_date, end_date, list(target_names)),
                 )
                 if records:
-                    cur.executemany(insert_query, records)
+                    if metadata_supplied:
+                        insert_records = [
+                            record + metadata_values for record in records
+                        ]
+                    else:
+                        insert_records = records
+                    cur.executemany(insert_query, insert_records)
             conn.commit()
         except Exception:
             conn.rollback()
@@ -289,24 +350,47 @@ def backfill_stock(
     max_date: int,
     apply: bool,
     trading_dates: list[int] | None = None,
+    close_only: bool = False,
+    build_id: str | None = None,
 ) -> dict:
     """Rebuild one stock's target indicator rows within the requested date range.
 
-    The backfill uses the same trading-calendar alignment as the normal compute
-    pipeline. Missing trading sessions are forward-filled for Raw/HFQ prices and
-    receive volume=0 before indicators are computed. This is essential because
-    close-HFQ rolling scores are intentionally computed on those aligned sessions.
+    Two data paths with different contracts (C2 semantics; do not mix them):
+
+    - Volume Z-score: computed on the calendar-aligned frame (missing sessions
+      receive volume=0; volume_zscore() treats zero/non-positive volumes as
+      invalid observations). Replacement scope is the aligned calendar span
+      inside the signal range. In close_only mode Volume rows are completely
+      untouched (no delete, no insert, no metadata change).
+
+    - Close HFQ Z-score (C2): computed directly from the raw observation
+      series returned by the fixed Adjusted VIEW, BEFORE any calendar
+      forward-fill. Synthetic calendar rows never enter its window, and only
+      real observation dates receive a value. Replacement scope starts at the
+      signal start so stale synthetic values inside suspension/source gaps are
+      cleared, and ends at the stock's last real observation so rows outside
+      the recomputed span are never deleted. Close rows receive build identity
+      (factor_set_id / algorithm_version / build_id) when build_id is supplied.
+
+    Only the Close path writes provenance: this script recomputes the Close
+    definition (C2), while existing Volume rows cannot prove their provenance
+    and keep NULL metadata (never fabricate build identity).
     """
+    target_names = CLOSE_INDICATOR_NAMES if close_only else TARGET_INDICATOR_NAMES
     raw_df = get_stock_data(symbol, pre_warm_start_date, max_date).reset_index(drop=True)
-    records = []
+    volume_records: list[tuple] = []
+    close_records: list[tuple] = []
+    volume_eligible: list[str] = []
+    close_eligible: list[str] = []
     eligible_indicator_names: list[str] = []
     skipped_indicator_names: list[str] = []
     reason = None
-    df = raw_df
+    volume_replacement: tuple | None = None
+    close_replacement: tuple | None = None
 
     if raw_df.empty:
         reason = "no_source_data"
-        skipped_indicator_names = list(TARGET_INDICATOR_NAMES)
+        skipped_indicator_names = list(target_names)
     else:
         source_dates = pd.to_numeric(raw_df["date"], errors="coerce")
         has_signal_source = bool(
@@ -316,17 +400,21 @@ def backfill_stock(
             # No source rows in the requested signal range is not evidence that
             # old indicator rows are stale. Preserve the existing range.
             reason = "no_signal_dates"
-            skipped_indicator_names = list(TARGET_INDICATOR_NAMES)
+            skipped_indicator_names = list(target_names)
         elif source_dates.duplicated().any():
             raise ValueError(f"duplicate source dates for {symbol}; refusing replacement")
         else:
+            # Snapshot raw observation dates BEFORE align_with_calendar: the
+            # alignment helper converts the shared 'date' column to datetime
+            # in place, and C2 must keep reporting real observation dates.
+            raw_observation_dates = [int(value) for value in raw_df["date"].tolist()]
             calendar_dates = (
                 get_trading_dates(pre_warm_start_date, max_date)
                 if trading_dates is None else trading_dates
             )
             if not calendar_dates:
                 reason = "no_trading_calendar"
-                skipped_indicator_names = list(TARGET_INDICATOR_NAMES)
+                skipped_indicator_names = list(target_names)
             else:
                 calendar = pd.DataFrame({
                     "trade_date": pd.to_datetime(
@@ -334,68 +422,132 @@ def backfill_stock(
                         format="%Y%m%d",
                     )
                 })
-                # Reuse the normal compute pipeline's exact alignment contract:
+                # Volume keeps the normal compute pipeline's alignment contract:
                 # missing sessions -> forward-filled prices and volume/amount=0.
-                df = align_with_calendar(raw_df, calendar, symbol)
-                df["date"] = pd.to_datetime(df["date"]).dt.strftime("%Y%m%d").astype(int)
-                signal_df = df[df["date"].between(
+                aligned_df = align_with_calendar(raw_df, calendar, symbol)
+                aligned_df["date"] = (
+                    pd.to_datetime(aligned_df["date"])
+                    .dt.strftime("%Y%m%d")
+                    .astype(int)
+                )
+                signal_df = aligned_df[aligned_df["date"].between(
                     signal_start_date, max_date, inclusive="both"
                 )].copy()
 
                 if signal_df.empty:
                     reason = "no_signal_dates"
-                    skipped_indicator_names = list(TARGET_INDICATOR_NAMES)
+                    skipped_indicator_names = list(target_names)
                 else:
-                    volume_values = pd.to_numeric(
-                        df["volume"], errors="coerce"
-                    ).to_numpy(dtype=np.float64, na_value=np.nan)
-                    close_values = pd.to_numeric(
-                        df["close_hfq"], errors="coerce"
-                    ).to_numpy(dtype=np.float64, na_value=np.nan)
-                    valid_volume_count = int(
-                        np.count_nonzero(np.isfinite(volume_values) & (volume_values > 0))
-                    )
-                    close_validity = pd.Series(
-                        np.isfinite(close_values), dtype=np.int64
+                    # Raw close observations: invalid prices (non-finite or
+                    # non-positive) are excluded BEFORE z-score computation.
+                    # This is a price-validity rule, not a suspension fact.
+                    raw_close = pd.to_numeric(raw_df["close_hfq"], errors="coerce")
+                    raw_close = raw_close.where(
+                        np.isfinite(raw_close) & (raw_close > 0)
                     )
 
-                    # Eligibility is per series, not per maximum period. Volume
-                    # needs W prior valid observations plus current T. Close-HFQ
-                    # needs one complete W-row window after normal calendar fill.
+                    volume_values = pd.to_numeric(
+                        aligned_df["volume"], errors="coerce"
+                    ).to_numpy(dtype=np.float64, na_value=np.nan)
+                    valid_volume_count = int(
+                        np.count_nonzero(
+                            np.isfinite(volume_values) & (volume_values > 0)
+                        )
+                    )
+                    close_valid_count = int(raw_close.notna().sum())
+
+                    # Eligibility is per series, not per maximum period, and the
+                    # eligible list keeps the alternating volume/close order for
+                    # reporting compatibility. Volume needs W prior valid
+                    # observations plus current T. Close-HFQ (C2) needs W valid
+                    # raw observations overall.
                     for period in PERIODS:
                         volume_name = f"volume_zscore_{period}"
                         close_name = f"close_hfq_rolling_zscore_{period}"
-                        if valid_volume_count > period:
+                        if not close_only and valid_volume_count > period:
+                            volume_eligible.append(volume_name)
                             eligible_indicator_names.append(volume_name)
-                        else:
+                        elif not close_only:
                             skipped_indicator_names.append(volume_name)
-
-                        has_close_window = bool(
-                            close_validity.rolling(
-                                window=period, min_periods=period
-                            ).sum().ge(period).any()
-                        )
-                        if has_close_window:
+                        if close_valid_count >= period:
+                            close_eligible.append(close_name)
                             eligible_indicator_names.append(close_name)
                         else:
                             skipped_indicator_names.append(close_name)
 
                     if eligible_indicator_names:
-                        indicators = compute_indicators_for_stock(df)
-                        date_to_position = {
-                            int(date): position
-                            for position, date in enumerate(df["date"].tolist())
-                        }
-                        for _, row in signal_df.iterrows():
-                            record_date = int(row["date"])
-                            position = date_to_position[record_date]
-                            for indicator_name in eligible_indicator_names:
-                                series = indicators[indicator_name]
-                                value = series.iloc[position] if position < len(series) else np.nan
-                                if pd.notna(value):
-                                    records.append(
-                                        (symbol, record_date, indicator_name, float(value))
+                        indicators = compute_indicators_for_stock(aligned_df, raw_close)
+
+                        # Volume records: one per aligned calendar session in the
+                        # signal range (missing sessions get volume=0 and produce
+                        # no value inside volume_zscore itself).
+                        if volume_eligible:
+                            aligned_date_to_position = {
+                                int(date): position
+                                for position, date in enumerate(aligned_df["date"].tolist())
+                            }
+                            for _, row in signal_df.iterrows():
+                                record_date = int(row["date"])
+                                position = aligned_date_to_position[record_date]
+                                for indicator_name in volume_eligible:
+                                    series = indicators[indicator_name]
+                                    value = (
+                                        series.iloc[position]
+                                        if position < len(series)
+                                        else np.nan
                                     )
+                                    if pd.notna(value):
+                                        volume_records.append(
+                                            (symbol, record_date, indicator_name, float(value))
+                                        )
+                            volume_replacement = (
+                                symbol,
+                                int(signal_df["date"].min()),
+                                int(signal_df["date"].max()),
+                                volume_records,
+                                volume_eligible,
+                                None,
+                                None,
+                                None,
+                            )
+
+                        # Close records: only real observation dates inside the
+                        # signal range. Suspension/source-gap sessions produce
+                        # no value; their stale synthetic values are cleared by
+                        # the replacement scope below.
+                        if close_eligible:
+                            for position, record_date in enumerate(raw_observation_dates):
+                                if record_date < signal_start_date:
+                                    continue
+                                for indicator_name in close_eligible:
+                                    series = indicators[indicator_name]
+                                    value = series.iloc[position]
+                                    if pd.notna(value):
+                                        close_records.append(
+                                            (symbol, record_date, indicator_name, float(value))
+                                        )
+                            # Provenance is written only when the caller supplies
+                            # a build identity for this run; partial identity
+                            # would be misleading and is rejected downstream.
+                            if build_id is not None:
+                                close_metadata = (
+                                    FACTOR_SET_ID,
+                                    ALGORITHM_VERSION_CLOSE,
+                                    build_id,
+                                )
+                            else:
+                                close_metadata = (None, None, None)
+                            close_replacement = (
+                                symbol,
+                                signal_start_date,
+                                max(raw_observation_dates),
+                                close_records,
+                                close_eligible,
+                                close_metadata[0],
+                                close_metadata[1],
+                                close_metadata[2],
+                            )
+
                         if skipped_indicator_names:
                             reason = "partial_history"
                     else:
@@ -406,34 +558,25 @@ def backfill_stock(
             "symbol": symbol,
             "status": "dry_run",
             "reason": reason,
-            "rows": len(records),
+            "rows": len(volume_records) + len(close_records),
             "replaced": False,
             "eligible_indicators": eligible_indicator_names,
             "skipped_indicators": skipped_indicator_names,
         }
 
-    if eligible_indicator_names:
-        # Replace only series whose source history is sufficient to recompute
-        # them. Empty output for an eligible series is meaningful and clears
-        # stale values; missing sessions are present because df was calendar-aligned.
-        # Only replace the date interval that was actually materialized by
-        # calendar alignment and recomputed. The requested range can extend
-        # beyond a symbol's first/last available source session; deleting those
-        # unobserved edges would erase rows we did not regenerate.
-        replacement_start = int(signal_df["date"].min())
-        replacement_end = int(signal_df["date"].max())
-        replace_stock_records(
-            symbol,
-            replacement_start,
-            replacement_end,
-            records,
-            eligible_indicator_names,
-        )
+    replacements = [
+        replacement
+        for replacement in (volume_replacement, close_replacement)
+        if replacement is not None
+    ]
+    if replacements:
+        for replacement in replacements:
+            replace_stock_records(*replacement)
         return {
             "symbol": symbol,
             "status": "success",
             "reason": reason,
-            "rows": len(records),
+            "rows": len(volume_records) + len(close_records),
             "replaced": True,
             "eligible_indicators": eligible_indicator_names,
             "skipped_indicators": skipped_indicator_names,
@@ -462,7 +605,16 @@ def main() -> None:
     parser.add_argument("--max-date", type=int, default=None,
                         help="Max date (default: latest adjusted view date)")
     parser.add_argument("--symbols", nargs="*", help="Specific symbols to process")
+    parser.add_argument(
+        "--close-only",
+        action="store_true",
+        help="Recompute only the three close_hfq_rolling_zscore series; "
+        "Volume rows are left completely untouched.",
+    )
     args = parser.parse_args()
+
+    # One build identity per script run; only recomputed Close rows carry it.
+    build_id = str(uuid.uuid4())
 
     prepare_target_table(apply=args.apply)
 
@@ -483,6 +635,10 @@ def main() -> None:
     print(f"Pre-warm start date: {pre_warm_start_date} (source minimum; no earlier history)")
     print(f"Max date: {max_date}")
     print(f"Mode: {'APPLY (writes)' if args.apply else 'DRY-RUN (read-only, pass --apply to write)'}")
+    if args.close_only:
+        print("Scope: close-only (Volume rows untouched)")
+    print(f"Build id: {build_id}")
+    print(f"Close algorithm version: {ALGORITHM_VERSION_CLOSE}")
     breakdown = get_source_class_breakdown()
     print("Adjusted symbols by canonical asset_class (only stock eligible):")
     for _, row in breakdown.iterrows():
@@ -542,6 +698,8 @@ def main() -> None:
             result = backfill_stock(
                 symbol, start_date, pre_warm_start_date, max_date, args.apply,
                 trading_dates=trading_dates,
+                close_only=args.close_only,
+                build_id=build_id,
             )
 
             reason = result.get("reason")
