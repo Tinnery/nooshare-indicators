@@ -57,12 +57,19 @@ def verify_stock(code: str, conn) -> dict:
     """验证单只股票：读取原始数据，独立计算，与 PG 对比"""
     
     # 读取基础行情（含预热期）
+    # 数据源: Base 公开 VIEW public.market_daily_adjusted_bar（固定最新 validated factor set）
+    # 旧表 public.hfq_daily 已退役，不再读取。
     base_query = f"""
-    SELECT date, close_hfq, volume
-    FROM public.hfq_daily
-    WHERE symbol = '{code}'
-      AND date >= 20240101 AND date <= 20250630
-    ORDER BY date
+    SELECT a.date, a.close_hfq, a.volume
+    FROM public.market_daily_adjusted_bar a
+    WHERE a.symbol = '{code}'
+      AND a.factor_set_id = (
+          SELECT factor_set_id FROM public.market_adjustment_factor_set
+          WHERE status = 'validated'
+          ORDER BY validated_at DESC NULLS LAST LIMIT 1
+      )
+      AND a.date >= 20240101 AND a.date <= 20250630
+    ORDER BY a.date
     """
     base = pd.read_sql(base_query, conn)
     base["date"] = base["date"].astype(int)
