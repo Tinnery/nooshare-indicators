@@ -1,4 +1,4 @@
-"""Independent reference fixtures for the Z-score accuracy verifier."""
+"""Z-score 精度校验器的独立参考实现用的测试数据集。"""
 
 import numpy as np
 import pandas as pd

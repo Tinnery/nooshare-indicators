@@ -8,7 +8,7 @@ from scripts import backfill_zscore_2015 as backfill
 
 @pytest.fixture(autouse=True)
 def _synthetic_trading_calendar(monkeypatch):
-    # Synthetic fixtures use consecutive calendar dates as trading sessions.
+    # 构造的测试数据使用连续日历日作为交易日。
     monkeypatch.setattr(
         backfill,
         "get_trading_dates",
