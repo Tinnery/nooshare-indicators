@@ -354,8 +354,19 @@ def test_apply_backfill_replaces_only_series_with_sufficient_history(
             ("sh600519", 20240101, last_date, [], volume_names, None, None, None)
         )
     if close_names:
+        # The replacement scope covers ALL three Close indicator names (delete
+        # covers skipped/stale series too); records stay empty for NaN values.
         expected_replacements.append(
-            ("sh600519", 20240101, last_date, [], close_names, None, None, None)
+            (
+                "sh600519",
+                20240101,
+                last_date,
+                [],
+                list(backfill.CLOSE_INDICATOR_NAMES),
+                None,
+                None,
+                None,
+            )
         )
 
     if expected:
@@ -395,7 +406,11 @@ def test_volume_history_insufficiency_does_not_clear_volume_rows(monkeypatch):
     assert replacements[0][4] == result["eligible_indicators"]
 
 
-def test_close_history_insufficiency_does_not_clear_close_rows(monkeypatch):
+def test_close_history_insufficiency_clears_stale_close_rows(monkeypatch):
+    """C2: a window that can no longer be produced legitimately must not keep
+    old forward-fill-based rows. History-insufficient Close indicators are
+    delete-only inside the replacement scope (all three Close names covered),
+    while eligible Volume series keep their own replacement untouched."""
     frame = _stock_frame(n=21)
     frame["close_hfq"] = float("nan")
     replacements = []
@@ -416,9 +431,13 @@ def test_close_history_insufficiency_does_not_clear_close_rows(monkeypatch):
         "volume_zscore_10",
         "volume_zscore_20",
     ]
-    # Only the volume series is inside the replacement scope.
-    assert len(replacements) == 1
+    assert set(result["skipped_indicators"]) == set(backfill.CLOSE_INDICATOR_NAMES)
+    # Volume replacement plus the delete-only Close replacement.
+    assert len(replacements) == 2
     assert replacements[0][4] == result["eligible_indicators"]
+    # Close replacement spans every Close indicator but inserts no rows.
+    assert replacements[1][3] == []
+    assert replacements[1][4] == list(backfill.CLOSE_INDICATOR_NAMES)
 
 
 def test_close_history_missing_values_exclude_nan_observations(monkeypatch):
@@ -453,9 +472,9 @@ def test_close_history_missing_values_exclude_nan_observations(monkeypatch):
     assert replacements[0][4] == [
         "volume_zscore_5", "volume_zscore_10", "volume_zscore_20",
     ]
-    assert replacements[1][4] == [
-        "close_hfq_rolling_zscore_5", "close_hfq_rolling_zscore_10",
-    ]
+    # Scope covers all three Close names: z10's stale rows (if any) and the
+    # ineligible z20 are cleared; only z5 contributes new records.
+    assert replacements[1][4] == list(backfill.CLOSE_INDICATOR_NAMES)
 
 
 def test_missing_source_session_does_not_generate_close_zscore(monkeypatch):

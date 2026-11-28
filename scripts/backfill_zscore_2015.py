@@ -69,19 +69,37 @@ CLOSE_INDICATOR_NAMES = tuple(
 # by this run receive metadata; untouched/legacy rows keep NULL provenance.
 ALGORITHM_VERSION_CLOSE = "c2-effective-window-v1"
 
+# Same table contract as nooshare_indicators.infrastructure.database.init_schema():
+# the apply path must be able to initialize a brand-new database on its own,
+# including the build-identity provenance columns.
 ENSURE_TABLE_SQL = """
 CREATE TABLE IF NOT EXISTS indicators.daily_ts_zscore (
     code TEXT NOT NULL,
     date INTEGER NOT NULL,
     indicator_name TEXT NOT NULL,
     value DOUBLE PRECISION,
+    factor_set_id UUID,
+    algorithm_version TEXT,
+    build_id UUID,
     PRIMARY KEY (code, date, indicator_name)
 )
 """
 
+# Idempotent migration for tables created before the provenance columns
+# existed. Existing rows keep NULL metadata until a verified rebuild writes
+# provenance; never fabricate identity for legacy values.
+ENSURE_MIGRATION_SQL = """
+ALTER TABLE indicators.daily_ts_zscore
+    ADD COLUMN IF NOT EXISTS factor_set_id uuid,
+    ADD COLUMN IF NOT EXISTS algorithm_version text,
+    ADD COLUMN IF NOT EXISTS build_id uuid;
+"""
+
 
 def ensure_table() -> None:
+    db.execute_sql("CREATE SCHEMA IF NOT EXISTS indicators;")
     db.execute_sql(ENSURE_TABLE_SQL)
+    db.execute_sql(ENSURE_MIGRATION_SQL)
     db.execute_sql(
         "CREATE INDEX IF NOT EXISTS idx_daily_ts_zscore_date "
         "ON indicators.daily_ts_zscore (date)"
@@ -515,20 +533,57 @@ def backfill_stock(
                         # signal range. Suspension/source-gap sessions produce
                         # no value; their stale synthetic values are cleared by
                         # the replacement scope below.
-                        if close_eligible:
-                            for position, record_date in enumerate(raw_observation_dates):
-                                if record_date < signal_start_date:
-                                    continue
-                                for indicator_name in close_eligible:
-                                    series = indicators[indicator_name]
-                                    value = series.iloc[position]
-                                    if pd.notna(value):
-                                        close_records.append(
-                                            (symbol, record_date, indicator_name, float(value))
-                                        )
-                            # Provenance is written only when the caller supplies
-                            # a build identity for this run; partial identity
-                            # would be misleading and is rejected downstream.
+                        for position, record_date in enumerate(raw_observation_dates):
+                            if record_date < signal_start_date:
+                                continue
+                            for indicator_name in close_eligible:
+                                series = indicators[indicator_name]
+                                value = series.iloc[position]
+                                if pd.notna(value):
+                                    close_records.append(
+                                        (symbol, record_date, indicator_name, float(value))
+                                    )
+                        # Provenance is written only when the caller supplies
+                        # a build identity for this run; partial identity
+                        # would be misleading and is rejected downstream.
+                        if build_id is not None:
+                            close_metadata = (
+                                FACTOR_SET_ID,
+                                ALGORITHM_VERSION_CLOSE,
+                                build_id,
+                            )
+                        else:
+                            close_metadata = (None, None, None)
+                        # The replacement scope covers ALL three Close indicator
+                        # names, not only the eligible ones. An indicator whose
+                        # valid-observation count is below its window can never
+                        # produce a legitimate C2 value, so stale rows left by
+                        # older forward-fill-based formulas inside the recomputed
+                        # span must be cleared instead of surviving alongside C2
+                        # data. Eligible indicators contribute new records;
+                        # skipped ones are delete-only.
+                        close_replacement = (
+                            symbol,
+                            signal_start_date,
+                            max(raw_observation_dates),
+                            close_records,
+                            list(CLOSE_INDICATOR_NAMES),
+                            close_metadata[0],
+                            close_metadata[1],
+                            close_metadata[2],
+                        )
+
+                        if skipped_indicator_names:
+                            reason = "partial_history"
+                    else:
+                        reason = "insufficient_history"
+                        if close_only:
+                            # close-only run with no eligible Close indicator
+                            # at all: real source records exist inside the
+                            # signal range, so every Close window is
+                            # illegitimate under C2. Clear the stale rows
+                            # inside the recomputed span and insert nothing
+                            # (conservative: no fabrication).
                             if build_id is not None:
                                 close_metadata = (
                                     FACTOR_SET_ID,
@@ -541,17 +596,12 @@ def backfill_stock(
                                 symbol,
                                 signal_start_date,
                                 max(raw_observation_dates),
-                                close_records,
-                                close_eligible,
+                                [],
+                                list(CLOSE_INDICATOR_NAMES),
                                 close_metadata[0],
                                 close_metadata[1],
                                 close_metadata[2],
                             )
-
-                        if skipped_indicator_names:
-                            reason = "partial_history"
-                    else:
-                        reason = "insufficient_history"
 
     if not apply:
         return {
