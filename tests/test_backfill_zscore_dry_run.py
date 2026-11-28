@@ -777,6 +777,8 @@ def test_backfill_stock_with_build_id_writes_close_provenance(monkeypatch):
     # Volume keeps NULL provenance: its definition is not recomputed here.
     assert replacements[0][5:] == (None, None, None)
     # Close carries the full build identity of this run.
-    assert replacements[1][5] == "11111111-1111-4111-8111-111111111111"
+    # 版本号从配置读取，避免测试硬编码某个具体 factor set UUID
+    from nooshare_indicators import config as _cfg
+    assert replacements[1][5] == _cfg.MARKET_FACTOR_SET_ID
     assert replacements[1][6] == "c2-effective-window-v1"
     assert replacements[1][7] == "0f0e0d0c-0b0a-4009-8007-000605040302"
