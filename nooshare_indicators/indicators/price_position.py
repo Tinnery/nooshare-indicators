@@ -192,9 +192,6 @@ def price_position_in_range(
     return (close - n_low) / (n_high - n_low)
 
 
-    return result
-
-
 def compute_all_price_position(
     open: pd.Series,
     high: pd.Series,
@@ -252,34 +249,52 @@ def compute_all_price_position(
 def close_hfq_rolling_zscore(close_hfq: pd.Series, period: int) -> pd.Series:
     """
     后复权收盘价的 Rolling Z-score（C2 语义：最近 N 个有效观察）。
-    
-    只使用有效的收盘价观察（NaN 被排除），计算最近 period 个有效观察的 Z-score。
-    原始索引中无观察的日期返回 NaN。
-    
+
+    只使用有效观察计算最近 period 个有效观察（含当日 T）的 Z-score。
+    原始索引中无有效观察的日期返回 NaN。
+
+    有效观察 = 有限数值且严格大于 0。NaN、正负 Inf、零价和负价
+    永远不进入有效观察窗口，也不会被 forward-fill。
+
     Z = (close_hfq - mean(valid_close, period)) / std(valid_close, period)
-    
+
     Args:
-        close_hfq: 后复权收盘价序列（可含 NaN）
+        close_hfq: 后复权收盘价序列（可含 NaN / Inf / 非数值）
         period: 滚动窗口大小（有效观察数量）
-    
+
     Returns:
-        Z-score 序列（原始索引，无观察日为 NaN）
+        Z-score 序列（原始索引，无有效观察日为 NaN）
+
+    Raises:
+        ValueError: 索引存在重复标签（重复观察的滚动窗口语义未定义，
+            必须显式失败而不是静默产出错误值）。
     """
+    if close_hfq.index.has_duplicates:
+        raise ValueError(
+            "close_hfq_rolling_zscore requires a unique index; duplicate "
+            "observations have undefined rolling-window semantics"
+        )
+
     # 保存原始索引
     original_index = close_hfq.index
-    
-    # 剔除 NaN，只保留有效观察
-    valid_close = close_hfq.dropna()
-    
-    # 在有效观察序列上计算 rolling zscore
+
+    # 先做数值转换：非数值条目 coerce 成 NaN 而不是抛异常
+    numeric_close = pd.to_numeric(close_hfq, errors="coerce")
+
+    # C2 有效观察：有限且 > 0。NaN / 正负 Inf / 零价 / 负价全部排除。
+    valid_close = numeric_close.where(
+        np.isfinite(numeric_close) & (numeric_close > 0)
+    ).dropna()
+
+    # 在有效观察序列上计算 rolling zscore（合成日历日不可能进入窗口：
+    # 它们在上方被过滤，而不是被 forward-fill）
     rolling_mean = valid_close.rolling(window=period, min_periods=period).mean()
     rolling_std = valid_close.rolling(window=period, min_periods=period).std(ddof=1)
-    
+
     zscore = (valid_close - rolling_mean) / rolling_std
     zscore = zscore.replace([np.inf, -np.inf], np.nan)
-    
-    # reindex 回原始索引（无观察日自动为 NaN）
-    result = zscore.reindex(original_index)
-    
-    return result
 
+    # reindex 回原始索引（无有效观察日自动为 NaN）
+    result = zscore.reindex(original_index)
+
+    return result

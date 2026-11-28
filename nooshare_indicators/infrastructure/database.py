@@ -278,7 +278,7 @@ def init_schema():
 
     -- Time-series rolling z-score store (target of scripts/backfill_zscore_2015.py)
     -- Build identity columns: only rows written by a verified rebuild carry
-    -- provenance; legacy rows keep NULL until they are actually recomputed.
+    -- provenance. Legacy rows keep NULL until they are actually recomputed.
     CREATE TABLE IF NOT EXISTS indicators.daily_ts_zscore (
         code TEXT NOT NULL,
         date INTEGER NOT NULL,
