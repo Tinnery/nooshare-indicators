@@ -246,7 +246,7 @@ def compute_all_price_position(
     return results
 
 
-def close_hfq_rolling_zscore(close_hfq: pd.Series, period: int) -> pd.Series:
+def close_hfq_rolling_zscore(close_hfq: pd.Series, period: int, is_synthetic: pd.Series = None) -> pd.Series:
     """
     后复权收盘价的 Rolling Z-score（C2 语义：最近 N 个有效观察）。
 
@@ -261,6 +261,7 @@ def close_hfq_rolling_zscore(close_hfq: pd.Series, period: int) -> pd.Series:
     Args:
         close_hfq: 后复权收盘价序列（可含 NaN / Inf / 非数值）
         period: 滚动窗口大小（有效观察数量）
+        is_synthetic: 布尔序列，标记合成日历日（可选）
 
     Returns:
         Z-score 序列（原始索引，无有效观察日为 NaN）
@@ -282,9 +283,13 @@ def close_hfq_rolling_zscore(close_hfq: pd.Series, period: int) -> pd.Series:
     numeric_close = pd.to_numeric(close_hfq, errors="coerce")
 
     # C2 有效观察：有限且 > 0。NaN / 正负 Inf / 零价 / 负价全部排除。
-    valid_close = numeric_close.where(
-        np.isfinite(numeric_close) & (numeric_close > 0)
-    ).dropna()
+    valid_mask = np.isfinite(numeric_close) & (numeric_close > 0)
+    
+    # 如果提供 is_synthetic，合成日历日也排除
+    if is_synthetic is not None:
+        valid_mask = valid_mask & ~is_synthetic
+    
+    valid_close = numeric_close.where(valid_mask).dropna()
 
     # 在有效观察序列上计算 rolling zscore（合成日历日不可能进入窗口：
     # 它们在上方被过滤，而不是被 forward-fill）

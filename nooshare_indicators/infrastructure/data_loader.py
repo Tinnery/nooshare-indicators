@@ -126,7 +126,7 @@ def load_stock_daily(symbol: str, start_date: Optional[int] = None) -> pd.DataFr
     SELECT symbol, date, 
            open, high, low, close,
            open_hfq, high_hfq, low_hfq, close_hfq,
-           volume, amount
+           volume, amount, factor_status
     FROM public.market_daily_adjusted_bar
     WHERE symbol = %s AND date >= %s AND factor_set_id = %s
     ORDER BY date
@@ -160,7 +160,7 @@ def load_all_stocks_daily_batch(
     SELECT symbol, date,
            open, high, low, close,
            open_hfq, high_hfq, low_hfq, close_hfq,
-           volume, amount
+           volume, amount, factor_status
     FROM public.market_daily_adjusted_bar
     WHERE symbol IN ({placeholders}) AND date >= %s AND factor_set_id = %s
     ORDER BY symbol, date
@@ -248,6 +248,19 @@ def align_with_calendar(
     # Merge with actual data
     df = calendar_df.join(df, how="left")
 
+    # Mark synthetic dates BEFORE ffill (C2 semantic: zscore must use real observations only)
+    # is_synthetic=True means this calendar date had no real observation for this source,
+    # i.e. the row was created by calendar alignment rather than emitted by the data product.
+    # Judge on the column the C2 zscore actually consumes (close_hfq), falling back to close.
+    obs_col = "close_hfq" if "close_hfq" in df.columns else ("close" if "close" in df.columns else None)
+    if obs_col is None:
+        df["is_synthetic"] = False
+    else:
+        df["is_synthetic"] = df[obs_col].isna()
+
+    # factor_status must NOT be forward-filled: a synthetic date has no factor record,
+    # so it correctly stays NULL and cannot masquerade as a real quality state.
+    
     # Fill missing prices with forward fill - handle both Raw and HFQ
     price_cols = ["open", "high", "low", "close"]
     hfq_cols = ["open_hfq", "high_hfq", "low_hfq", "close_hfq"]

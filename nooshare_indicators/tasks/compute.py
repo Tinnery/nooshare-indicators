@@ -280,7 +280,7 @@ def compute_all_indicators(
             # Rolling Z-score for close_hfq (T02)
             zscore_rows = []
             for period in [5, 10, 20]:
-                zs = pp.close_hfq_rolling_zscore(close_s, period)
+                zs = pp.close_hfq_rolling_zscore(close_s, period, is_synthetic=df.get("is_synthetic"))
                 for i, value in enumerate(zs):
                     if pd.notna(value):
                         zscore_rows.append({
