@@ -277,11 +277,16 @@ def init_schema():
     );
 
     -- Time-series rolling z-score store (target of scripts/backfill_zscore_2015.py)
+    -- Build identity columns: only rows written by a verified rebuild carry
+    -- provenance. Legacy rows keep NULL until they are actually recomputed.
     CREATE TABLE IF NOT EXISTS indicators.daily_ts_zscore (
         code TEXT NOT NULL,
         date INTEGER NOT NULL,
         indicator_name TEXT NOT NULL,
         value DOUBLE PRECISION,
+        factor_set_id UUID,
+        algorithm_version TEXT,
+        build_id UUID,
         PRIMARY KEY (code, date, indicator_name)
     );
 
@@ -314,6 +319,18 @@ def init_schema():
         stmt = stmt.strip()
         if stmt:
             execute_sql(stmt + ";")
+
+    # Idempotent migration for stores created before the build-identity
+    # columns existed. Existing rows keep NULL metadata until a verified
+    # rebuild writes provenance; never fabricate identity for legacy values.
+    execute_sql(
+        """
+        ALTER TABLE indicators.daily_ts_zscore
+            ADD COLUMN IF NOT EXISTS factor_set_id uuid,
+            ADD COLUMN IF NOT EXISTS algorithm_version text,
+            ADD COLUMN IF NOT EXISTS build_id uuid;
+        """
+    )
 
     # Create indexes
     indexes_sql = """

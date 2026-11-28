@@ -192,29 +192,6 @@ def price_position_in_range(
     return (close - n_low) / (n_high - n_low)
 
 
-def close_hfq_rolling_zscore(close_hfq: pd.Series, period: int) -> pd.Series:
-    """
-    Rolling Z-score of HFQ close price.
-
-    Z = (close_hfq - rolling_mean) / rolling_std
-
-    Uses ddof=1 (sample std). Zero std returns NaN (not 0 or inf).
-
-    Args:
-        close_hfq: HFQ close prices
-        period: Rolling window size
-
-    Returns:
-        Rolling Z-score series
-    """
-    rolling_mean = close_hfq.rolling(window=period, min_periods=period).mean()
-    rolling_std = close_hfq.rolling(window=period, min_periods=period).std(ddof=1)
-    result = (close_hfq - rolling_mean) / rolling_std
-    # Replace inf/-inf with NaN (zero std case)
-    result = result.replace([np.inf, -np.inf], np.nan)
-    return result
-
-
 def compute_all_price_position(
     open: pd.Series,
     high: pd.Series,
@@ -269,23 +246,60 @@ def compute_all_price_position(
     return results
 
 
-def close_hfq_rolling_zscore(close_hfq: pd.Series, period: int) -> pd.Series:
+def close_hfq_rolling_zscore(close_hfq: pd.Series, period: int, is_synthetic: pd.Series = None) -> pd.Series:
     """
-    后复权收盘价的 Rolling Z-score。
-    
-    Z = (close_hfq - mean(close_hfq, period)) / std(close_hfq, period)
-    
+    后复权收盘价的 Rolling Z-score（C2 语义：最近 N 个有效观察）。
+
+    只使用有效观察计算最近 period 个有效观察（含当日 T）的 Z-score。
+    原始索引中无有效观察的日期返回 NaN。
+
+    有效观察 = 有限数值且严格大于 0。NaN、正负 Inf、零价和负价
+    永远不进入有效观察窗口，也不会被 forward-fill。
+
+    Z = (close_hfq - mean(valid_close, period)) / std(valid_close, period)
+
     Args:
-        close_hfq: 后复权收盘价序列
-        period: 滚动窗口大小
-    
+        close_hfq: 后复权收盘价序列（可含 NaN / Inf / 非数值）
+        period: 滚动窗口大小（有效观察数量）
+        is_synthetic: 布尔序列，标记合成日历日（可选）
+
     Returns:
-        Z-score 序列
+        Z-score 序列（原始索引，无有效观察日为 NaN）
+
+    Raises:
+        ValueError: 索引存在重复标签（重复观察的滚动窗口语义未定义，
+            必须显式失败而不是静默产出错误值）。
     """
-    rolling_mean = close_hfq.rolling(window=period, min_periods=period).mean()
-    rolling_std = close_hfq.rolling(window=period, min_periods=period).std(ddof=1)
+    if close_hfq.index.has_duplicates:
+        raise ValueError(
+            "close_hfq_rolling_zscore requires a unique index; duplicate "
+            "observations have undefined rolling-window semantics"
+        )
+
+    # 保存原始索引
+    original_index = close_hfq.index
+
+    # 先做数值转换：非数值条目 coerce 成 NaN 而不是抛异常
+    numeric_close = pd.to_numeric(close_hfq, errors="coerce")
+
+    # C2 有效观察：有限且 > 0。NaN / 正负 Inf / 零价 / 负价全部排除。
+    valid_mask = np.isfinite(numeric_close) & (numeric_close > 0)
     
-    zscore = (close_hfq - rolling_mean) / rolling_std
+    # 如果提供 is_synthetic，合成日历日也排除
+    if is_synthetic is not None:
+        valid_mask = valid_mask & ~is_synthetic
+    
+    valid_close = numeric_close.where(valid_mask).dropna()
+
+    # 在有效观察序列上计算 rolling zscore（合成日历日不可能进入窗口：
+    # 它们在上方被过滤，而不是被 forward-fill）
+    rolling_mean = valid_close.rolling(window=period, min_periods=period).mean()
+    rolling_std = valid_close.rolling(window=period, min_periods=period).std(ddof=1)
+
+    zscore = (valid_close - rolling_mean) / rolling_std
     zscore = zscore.replace([np.inf, -np.inf], np.nan)
-    
-    return zscore
+
+    # reindex 回原始索引（无有效观察日自动为 NaN）
+    result = zscore.reindex(original_index)
+
+    return result

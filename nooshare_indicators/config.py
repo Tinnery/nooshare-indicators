@@ -39,6 +39,8 @@ MIN_DATE = 20190101
 # 保证同一代码版本在不同时间读到同一 HFQ 序列（可复现/PIT）。
 # v1 = 11111111-1111-4111-8111-111111111111；DEV 2026-11-28 A/B 500股×全历史
 # 877,990 行 raw/hfq/volume/amount 全 0 mismatch，全量行数一致。
+# v2 = 0560b30c-1f8c-4aef-8607-f1751d101164（Factor Builder 从 Raw+gbbq 构建）
+# v1 仍保留用于历史 Run 复现，但新计算默认使用 v2。
 MARKET_FACTOR_SET_ID = os.environ.get(
-    "MARKET_FACTOR_SET_ID", "11111111-1111-4111-8111-111111111111"
+    "MARKET_FACTOR_SET_ID", "0560b30c-1f8c-4aef-8607-f1751d101164"
 )
